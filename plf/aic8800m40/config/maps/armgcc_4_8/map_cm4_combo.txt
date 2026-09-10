@@ -234,7 +234,17 @@ SECTIONS
     PROVIDE(__stack = __StackTop);
 
     /* Check if data + stack exceeds RAM limit */
+    /* In the split-heap build, comparing a DRAM address with HeapLimit in
+     * D_HEAP cannot detect static data colliding with the main stack. */
+    ASSERT(ADDR(.uninited) + SIZEOF(.uninited) <= __StackLimit,
+           "DRAM data overlaps main stack")
+    #if !defined(CFG_FLASH_FW) && !defined(CFG_DPD)
+    ASSERT(ADDR(.heap) >= ORIGIN(D_HEAP) &&
+           __HeapLimit <= ORIGIN(D_HEAP) + LENGTH(D_HEAP),
+           "RTOS heap exceeds D_HEAP")
+    #else
     ASSERT(__StackLimit >= __HeapLimit, "region DRAM overflowed with stack")
+    #endif
 
     /* IPC shared RAM */
     IPC_SHARED (NOLOAD):

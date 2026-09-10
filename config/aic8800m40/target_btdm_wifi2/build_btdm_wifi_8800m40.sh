@@ -40,4 +40,4 @@ python ../../../tools/scons.py -u . PRODUCT=host-wb PLF=aic8800m40 BT=armgcc_4_8
         BLE_DFT_STATE=none BLE_APP_AUDTRANSMIT=none BLE_APP_SMARTCONFIG=off BLE_APP_HID=off  \
         A2DP=off A2DP_SOURCE=off HFP_AG=off LINK_ONE=off AUD_USED=off \
 		BAND5G=on SOFTAP=on IPERF=on PING=on CHKSUM=off DPD=off TGT_MODE=btdm_wifi FHOST_APP=console\
-    WIFI_RAM_VER=on HEAP_SIZE=0x30000 USB_DEVICE=on  $opt
+    WIFI_RAM_VER=on HEAP_SIZE=0x40000 USB_DEVICE=on  $opt

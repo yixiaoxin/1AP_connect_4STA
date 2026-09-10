@@ -1,6 +1,7 @@
-这是AP端的代码，主要作了两点优化：
+这是 AIC8800M40 USB UAC 接收器 AP 项目，音频业务已改为四个 STA（ID 1～4）通过 UDP 通信。
 
-1，socket发送阻塞的延时设置成了500ms,#define UACM_TX_BACKPRESSURE_TIMEOUT_MS      500U
+- UDP 8888 播放、8890 录音；保留 BPK2 压缩，增加分片重组、注册与超时管理。
+- 四路录音混音为 USB 48 kHz / PCM16 立体声；每路录音缓冲 40 ms。
+- 音频池启动时分配到独立堆；四路构建 profile 使用 256 KiB 堆并增加链接边界检查。
 
-2,lwip的lwipopts.h中设置了TCP_SND_BUF为8K字节，#define TCP_SND_BUF                8192
-
+完整协议、内存分析、构建和验证步骤见 [UDP4 重构说明](docs/UDP4_REFACTOR.md)。STA 固件必须同步修改，旧 TCP STA 不兼容。主机测试已通过，ARM 完整编译与上板验证尚未完成；`build/` 中原有固件不是本次改造的产物。

@@ -55,7 +55,13 @@ uint16_t fhost_ip_chksum(const void *dataptr, int len);
 #define DEFAULT_THREAD_STACKSIZE      1024
 #define DEFAULT_THREAD_PRIO           1
 #define DEFAULT_RAW_RECVMBOX_SIZE     32
+#ifdef CFG_HOSTAPD
+/* Two shared audio sockets; byte limits are set per socket by the bridge. */
+#define DEFAULT_UDP_RECVMBOX_SIZE     8
+#define LWIP_SO_RCVBUF                1
+#else
 #define DEFAULT_UDP_RECVMBOX_SIZE     32
+#endif
 /* Bound queued TCP netbufs on the AP.  Thirty-two ~1 KB audio netbufs per
  * socket can exhaust the small lwIP heap before the audio task catches up. */
 #ifdef CFG_HOSTAPD
