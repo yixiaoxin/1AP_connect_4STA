@@ -252,6 +252,27 @@ int main(void)
     assert(!strcmp(rate, "100.00%"));
     test_transport(); test_codec(); test_sequence(); test_mixer(); test_sessions();
     test_diag_timeout(); test_send();
+    {
+        uacm_session_t sessions[UACM_SESSION_COUNT] = {0};
+        s_session = sessions;
+        sessions[0].client_id = 1;
+        sessions[0].playback_packets = 996;
+        sessions[0].diag_recv = 498;
+        uacm_log_audio_diag();
+        assert(strstr(mock_log, "PLAY sent=996/1000"));
+        assert(strstr(mock_log, "REC recv=498/500"));
+        assert(strstr(mock_log, "local_loss=0.40%"));
+        assert(strstr(mock_log, "gap_rate=0.40%"));
+        assert(strstr(mock_log, "\n==========\nAP T"));
+        mock_log[0] = 0;
+        sessions[0].playback_packets += 900;
+        sessions[0].diag_recv += 600;
+        uacm_log_audio_diag();
+        assert(strstr(mock_log, "PLAY sent=900/1000"));
+        assert(strstr(mock_log, "local_loss=10.00%"));
+        assert(strstr(mock_log, "REC recv=600/500"));
+        assert(strstr(mock_log, "gap_rate=0.00%"));
+    }
     puts("PASS: UDP fragments/reorder/duplicates/timeout/bounds/wrap; codec/CRC; four-source mix; registration/pinning/expiry/reconnect; TX fragments/stale drop");
     return 0;
 }

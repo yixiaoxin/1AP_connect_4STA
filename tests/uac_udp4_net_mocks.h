@@ -12,6 +12,17 @@ static unsigned mock_sent_len;
 static uint8_t mock_wire[1017];
 static struct sockaddr_in mock_peer;
 static volatile uint8_t s_usb_mic_on;
+static char mock_log[4096];
+static uint32_t rtos_protect(void) { return 0; }
+static void rtos_unprotect(uint32_t level) { (void)level; }
+static void dbg(const char *format, ...)
+{
+    va_list args;
+    size_t used = strlen(mock_log);
+    va_start(args, format);
+    vsnprintf(mock_log + used, sizeof(mock_log) - used, format, args);
+    va_end(args);
+}
 static uint32_t uacm_now_ms(void) { return mock_now; }
 static uint64_t uacm_time_us(void) { return (uint64_t)mock_now * 1000; }
 /* TX tests seed an already-encoded frame; codec itself is tested separately. */

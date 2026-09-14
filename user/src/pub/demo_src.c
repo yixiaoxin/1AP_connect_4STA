@@ -2044,6 +2044,10 @@ static void uacm_diag_rate(char *out, uint32_t lost, uint64_t expected)
     }
 }
 
+#define UACM_DIAG_INTERVAL_MS 10000U
+#define UACM_DIAG_PLAY_EXPECTED (UACM_DIAG_INTERVAL_MS / 10U)
+#define UACM_DIAG_REC_EXPECTED  (UACM_DIAG_INTERVAL_MS / 20U)
+
 static void uacm_log_audio_diag(void)
 {
     static uint32_t previous[UACM_SESSION_COUNT][12];
@@ -2073,10 +2077,15 @@ static void uacm_log_audio_diag(void)
             delta[j] = current[j] - previous[i][j];
             previous[i][j] = current[j];
         }
-        play_expected = delta[0] + delta[1] + delta[2] + delta[3];
-        rec_expected = delta[4] + delta[5];
-        uacm_diag_rate(play_rate, delta[1] + delta[2] + delta[3], play_expected);
-        uacm_diag_rate(rec_rate, delta[5], rec_expected);
+        /* Fixed nominal 10-second targets, NOT inferred from received seqs.
+         * These rates measure throughput shortfall, including idle periods.
+         * REC10 fallback can exceed the nominal REC20 target; clamp at 0%. */
+        play_expected = UACM_DIAG_PLAY_EXPECTED;
+        rec_expected = UACM_DIAG_REC_EXPECTED;
+        uacm_diag_rate(play_rate, delta[0] < play_expected ? play_expected - delta[0] : 0U,
+                       play_expected);
+        uacm_diag_rate(rec_rate, delta[4] < rec_expected ? rec_expected - delta[4] : 0U,
+                       rec_expected);
         dbg("AP T%u PLAY sent=%u/%u drop_q=%u drop_to=%u drop_err=%u local_loss=%s\n",
             (unsigned)a->client_id, (unsigned)delta[0], (unsigned)play_expected,
             (unsigned)delta[1], (unsigned)delta[2], (unsigned)delta[3], play_rate);
@@ -2086,6 +2095,7 @@ static void uacm_log_audio_diag(void)
         dbg("AP T%u UDP tx_pkt=%u rx_pkt=%u tx_busy=%u asm_timeout=%u rx_gap_max_ms=%u\n",
             (unsigned)a->client_id, (unsigned)delta[8], (unsigned)delta[9],
             (unsigned)delta[10], (unsigned)delta[11], (unsigned)gap_max);
+        dbg("==========\n");
     }
 }
 
@@ -2096,6 +2106,7 @@ static void uacm_network_task(void *arg)
     uint8_t was_active = 0;
     (void)arg;
     while (!s_workers_ready) rtos_task_suspend(1U);
+    last_log = uacm_now_ms();
     while (1) {
         uint32_t i, now = uacm_now_ms();
         uint8_t active = s_usb_mic_on || s_usb_spk_on;
@@ -2114,7 +2125,7 @@ static void uacm_network_task(void *arg)
         rr = (rr + 1U) % UACM_SESSION_COUNT;
         if (was_active && !active) uacm_log_record48_check();
         was_active = active;
-        if (now - last_log >= 10000U) {
+        if (now - last_log >= UACM_DIAG_INTERVAL_MS) {
             int total, free_bytes, minimum;
             rtos_heap_info(&total, &free_bytes, &minimum);
             dbg("UACM HEAP total=%d free=%d min=%d\n", total, free_bytes, minimum);

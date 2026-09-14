@@ -23,6 +23,7 @@ def function(name):
 
 prefix = '''#include <stdint.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <string.h>
 #define NX_REMOTE_STA_MAX 8
@@ -50,7 +51,8 @@ network = (root / 'tests/uac_udp4_net_mocks.h').read_text() + ''.join(function(n
 out = root / 'build/uac_udp4_tests'
 out.mkdir(parents=True, exist_ok=True)
 cfile = out / 'core.c'
-cfile.write_text(prefix + types + codec + globals_ + functions + network +
+diagnostics = src[src.index('#define UACM_DIAG_INTERVAL_MS'):src.index('static void uacm_network_task')]
+cfile.write_text(prefix + types + codec + globals_ + functions + network + diagnostics +
                  (root / 'tests/uac_udp4_host.c').read_text(), encoding='utf-8')
 exe = out / 'core.exe'
 subprocess.run([args.cc, '-std=c99', '-O2', '-Wall', '-Wextra',
