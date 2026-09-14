@@ -338,6 +338,12 @@ typedef struct {
     uint64_t level_power;
     uint32_t gain_q15;
 
+    /* Lifetime diagnostic counters: never reset on reconnect. */
+    uint32_t diag_drop_q, diag_drop_to, diag_drop_err;
+    uint32_t diag_recv, diag_decode_fail;
+    uint32_t diag_tx_pkt, diag_rx_pkt, diag_tx_busy, diag_asm_timeout;
+    uint32_t diag_rx_last_ms, diag_rx_gap_max_ms;
+    uint8_t diag_rx_time_valid, diag_asm_expired, diag_mic_on_seen;
     uint32_t playback_packets;
     uint32_t playback_drop;
     uint32_t play_lossless_comp_packets;
@@ -382,7 +388,7 @@ static uacm_ring_t s_usb_spk_ring = { s_usb_spk_storage, UACM_USB_SPK_RING_BYTES
 static uacm_ring_t s_usb_mic_ring = { s_usb_mic_storage, UACM_USB_MIC_RING_BYTES, 0U, 0U };
 typedef struct {
     uacm_session_t session[UACM_SESSION_COUNT];
-    uint8_t tx[UACM_SESSION_COUNT][UACM_SESSION_TX_RING_BYTES];
+    uint8_t tx[UACM_SESSION_COUNT][UACM_SESSION_TX_RING_BYTES];//7.5kB的会话缓冲区
     uint8_t rx[UACM_SESSION_COUNT][UACM_SESSION_RX_RING_BYTES];
 } uacm_audio_pool_t;
 static uacm_session_t *s_session;
@@ -811,6 +817,9 @@ static void uacm_session_audio_reset(uacm_session_t *s)
 
 static void uacm_close_playback(uacm_session_t *s)
 {
+    s->diag_drop_err += (s->tx_ring.write_pos - s->tx_ring.read_pos) /
+                       UACM_PLAYBACK_PCM_BYTES;
+    if (s->tx_len && s->tx_kind == UACM_TX_KIND_PCM) s->diag_drop_err++;
     s->playback_fd = -1; /* shared UDP socket remains open */
     uacm_ring_reset(&s->tx_ring);
     s->tx_len = 0U;
@@ -841,6 +850,8 @@ static void uacm_rx_unlock(uacm_session_t *s)
 
 static void uacm_close_record(uacm_session_t *s)
 {
+    s->diag_rx_time_valid = 0U;
+    s->diag_asm_expired = 0U;
     s->record_fd = -1; /* shared UDP socket remains open */
     memset(&s->assembly, 0, sizeof(s->assembly));
     uacm_rx_lock(s);
@@ -863,7 +874,7 @@ static int uacm_init_sessions(void)
 {
     uint32_t i;
     int total, free_bytes, minimum;
-    uacm_audio_pool_t *pool;
+    uacm_audio_pool_t *pool;//包含了所有会话的缓冲区和状态信息
     /* Task stack_depth is in 32-bit words, not bytes. Keep another 32 KB
      * for association, DHCP, socket queues and runtime allocations. */
     uint32_t required = sizeof(uacm_audio_pool_t) +
@@ -872,17 +883,17 @@ static int uacm_init_sessions(void)
     rtos_heap_info(&total, &free_bytes, &minimum);
     dbg("UACM MEM pool=%u heap=%d free=%d required=%u\n",
         (unsigned)sizeof(uacm_audio_pool_t), total, free_bytes, (unsigned)required);
-    if (free_bytes < 0 || (uint32_t)free_bytes < required) return -1;
-    pool = rtos_calloc(1U, sizeof(*pool));
+    if (free_bytes < 0 || (uint32_t)free_bytes < required) return -1;//如果内存空间不足，返回错误
+    pool = rtos_calloc(1U, sizeof(*pool));//分配动态内存给pool
     if (!pool) return -1;
-    for (i = 0U; i < UACM_SESSION_COUNT; i++) {
+    for (i = 0U; i < UACM_SESSION_COUNT; i++) {//初始化每个会话的状态和缓冲区
         uacm_session_t *a = &pool->session[i];
         a->client_id = UACM_FIRST_CLIENT_ID + i;
         a->playback_fd = a->record_fd = -1;
         a->tx_ring.storage = pool->tx[i];
-        a->tx_ring.capacity = UACM_SESSION_TX_RING_BYTES;
+        a->tx_ring.capacity = UACM_SESSION_TX_RING_BYTES;//1920B
         a->rx_ring.storage = pool->rx[i];
-        a->rx_ring.capacity = UACM_SESSION_RX_RING_BYTES;
+        a->rx_ring.capacity = UACM_SESSION_RX_RING_BYTES;//1920B
         if (rtos_mutex_create(&a->rx_mutex) != 0) {
             while (i) rtos_mutex_delete(pool->session[--i].rx_mutex);
             rtos_free(pool);
@@ -945,6 +956,18 @@ static int uacm_poll_udp(int fd, uint8_t direction)
     uint8_t wire[sizeof(uac_udp_header_t) + UAC_UDP_CHUNK + 1U];
     uint32_t i;
     if (fd < 0) return 0;
+    if (direction == AUDIO_DIR_STA_TO_AP) {
+        for (i = 0; i < UACM_SESSION_COUNT; ++i) {
+            uacm_session_t *a = &s_session[i];
+            if (a->diag_mic_on_seen != s_usb_mic_on) {
+                a->diag_mic_on_seen = s_usb_mic_on;
+                a->rx_seq_valid = 0U;
+                a->diag_rx_time_valid = 0U;
+                a->diag_asm_expired = 0U;
+                memset(&a->assembly, 0, sizeof(a->assembly));
+            }
+        }
+    }
     for (i = 0; i < UACM_RECORD_RX_BUDGET_READS; ++i) {
         struct sockaddr_in peer;
         socklen_t peer_len = sizeof(peer);
@@ -1011,6 +1034,22 @@ static int uacm_poll_udp(int fd, uint8_t direction)
             a = &s_session[uh.client_id - UACM_FIRST_CLIENT_ID];
             if (a->record_fd < 0 || !uacm_same_peer(&peer, &a->record_peer) ||
                 now - a->record_seen_ms >= UAC_UDP_PEER_TIMEOUT_MS) continue;
+            /* Count well-formed audio datagrams, including duplicates/old ones. */
+            if (uh.reserved || uh.total < sizeof(audio_header_t) ||
+                uh.total > UAC_UDP_MAX_FRAME || uh.offset >= uh.total ||
+                uh.offset % UAC_UDP_CHUNK ||
+                (uint32_t)(n - sizeof(uh)) !=
+                    (((uint32_t)(uh.total - uh.offset) > UAC_UDP_CHUNK) ?
+                     UAC_UDP_CHUNK : (uint32_t)(uh.total - uh.offset))) continue;
+            a->diag_rx_pkt++;
+            if (a->assembly.valid && !a->diag_asm_expired &&
+                a->assembly.mask != (a->assembly.total > UAC_UDP_CHUNK ? 3U : 1U) &&
+                now - a->assembly.started_ms > UAC_UDP_REASSEMBLY_MS) {
+                a->diag_asm_timeout++;
+                a->diag_asm_expired = 1U;
+            }
+            if (!a->assembly.valid || (int32_t)(uh.seq - a->assembly.seq) > 0)
+                a->diag_asm_expired = 0U;
             complete = uac_udp_assemble(&a->assembly, a->rx_stream, &uh,
                                         wire + sizeof(uh), n - sizeof(uh), now);
             if (complete <= 0) continue;
@@ -1024,6 +1063,13 @@ static int uacm_poll_udp(int fd, uint8_t direction)
     for (i = 0; i < UACM_SESSION_COUNT; ++i) {
         uacm_session_t *a = &s_session[i];
         uint32_t now = uacm_now_ms();
+        if (direction == AUDIO_DIR_STA_TO_AP && a->assembly.valid &&
+            !a->diag_asm_expired &&
+            a->assembly.mask != (a->assembly.total > UAC_UDP_CHUNK ? 3U : 1U) &&
+            now - a->assembly.started_ms > UAC_UDP_REASSEMBLY_MS) {
+            a->diag_asm_timeout++;
+            a->diag_asm_expired = 1U;
+        }
         if (direction == AUDIO_DIR_AP_TO_STA && a->playback_fd >= 0 &&
             now - a->playback_seen_ms >= UAC_UDP_PEER_TIMEOUT_MS) uacm_close_playback(a);
         if (direction == AUDIO_DIR_STA_TO_AP && a->record_fd >= 0 &&
@@ -1051,8 +1097,10 @@ static void uacm_enqueue_playback(uint8_t full_duplex)
         for (i = 0U; i < UACM_SESSION_COUNT; i++) {
             uacm_session_t *sess = &s_session[i];
             if (sess->playback_fd >= 0) {
+                uint32_t before = sess->playback_drop;
                 uacm_ring_keep_latest(&sess->tx_ring, pcm, sizeof(pcm),
                                       UACM_PLAYBACK_PCM_BYTES, &sess->playback_drop);
+                sess->diag_drop_q += sess->playback_drop - before;
             }
         }
     }
@@ -1212,6 +1260,7 @@ static int uacm_service_tx(uacm_session_t *s, uint32_t now_ms)
                     (struct sockaddr *)&s->playback_peer, sizeof(s->playback_peer));
         if (n >= 0) {
             if ((uint32_t)n != sizeof(h) + bytes) return -1;
+            s->diag_tx_pkt++;
             n = (int)bytes;
         }
     } else {
@@ -1256,10 +1305,14 @@ static int uacm_service_tx(uacm_session_t *s, uint32_t now_ms)
         }
         s->tx_last_errno = (uint32_t)errno;
         s->tx_backpressure_count++;
+        if (s->tx_kind == UACM_TX_KIND_PCM) s->diag_tx_busy++;
         if ((now_ms - s->tx_progress_ms) >= UACM_TX_STALE_MS) {
             /* UDP cannot backpressure the source: abandon the whole stale
              * audio frame, including any unsent fragment. Next seq exposes loss. */
-            if (s->tx_kind == UACM_TX_KIND_PCM) s->playback_drop++;
+            if (s->tx_kind == UACM_TX_KIND_PCM) {
+                s->playback_drop++;
+                s->diag_drop_to++;
+            }
             else s->ctrl_pending = 1U;
             s->tx_len = s->tx_off = 0;
             s->tx_kind = UACM_TX_KIND_NONE;
@@ -1277,18 +1330,21 @@ static uint32_t uacm_track_record_seq(uacm_session_t *s, uint32_t seq)
     if (!s->rx_seq_valid) {
         s->rx_seq_valid = 1U;
         s->rx_last_seq = seq;
+        s->diag_recv++;
         return 0U;
     }
 
     expect = s->rx_last_seq + 1U;
     if (seq == expect) {
         s->rx_last_seq = seq;
+        s->diag_recv++;
         return 0U;
     }
     if ((int32_t)(seq - expect) > 0) {
         uint32_t gap = seq - expect;
         s->seq_gap += gap;
         s->rx_last_seq = seq;
+        s->diag_recv++;
         return gap;
     }
 
@@ -1808,7 +1864,7 @@ static int uacm_decode_enqueue_record10(uacm_session_t *s,
     return 0;
 }
 
-static void uacm_handle_record_packet(uacm_session_t *s,
+static void uacm_decode_record_packet(uacm_session_t *s,
                                       const audio_header_t *h,
                                       const uint8_t *payload)
 {
@@ -1818,6 +1874,15 @@ static void uacm_handle_record_packet(uacm_session_t *s,
 
     if ((h->direction != AUDIO_DIR_STA_TO_AP) ||
         (h->client_id != s->client_id)) return;
+
+    if (h->packet_type != AUDIO_PACKET_TYPE_UAC_PCM_LOSSLESS20 &&
+        h->packet_type != AUDIO_PACKET_TYPE_UAC_PCM_LOSSLESS &&
+        h->packet_type != AUDIO_PACKET_TYPE_UAC_PCM) return;
+    /* Count complete application frames before decoding, once per sequence. */
+    uacm_rx_lock(s);
+    gap = uacm_track_record_seq(s, h->seq_num);
+    uacm_rx_unlock(s);
+    if (gap == 0xFFFFFFFFU) return;
 
     if (h->packet_type == AUDIO_PACKET_TYPE_UAC_PCM_LOSSLESS20) {
         uacm_rec20_header_t gh;
@@ -1839,8 +1904,6 @@ static void uacm_handle_record_packet(uacm_session_t *s,
         p1 = p0 + gh.len0;
 
         uacm_rx_lock(s);
-        gap = uacm_track_record_seq(s, h->seq_num);
-        if (gap == 0xFFFFFFFFU) { uacm_rx_unlock(s); return; }
         gap_blocks = (gap > 2U ? 12U : gap * 4U); /* one missing normal REC20 group = 20 ms = four 5 ms blocks */
 
         if (uacm_decode_enqueue_record10(s, p0, gh.len0, gap_blocks,
@@ -1864,8 +1927,6 @@ static void uacm_handle_record_packet(uacm_session_t *s,
         (h->packet_type != AUDIO_PACKET_TYPE_UAC_PCM)) return;
 
     uacm_rx_lock(s);
-    gap = uacm_track_record_seq(s, h->seq_num);
-    if (gap == 0xFFFFFFFFU) { uacm_rx_unlock(s); return; }
 
     if (h->packet_type == AUDIO_PACKET_TYPE_UAC_PCM_LOSSLESS) {
         if (uacm_decode_enqueue_record10(s, payload, h->data_len, (gap > 2U ? 6U : gap * 2U),
@@ -1892,6 +1953,26 @@ static void uacm_handle_record_packet(uacm_session_t *s,
 }
 
 
+
+static void uacm_handle_record_packet(uacm_session_t *s,
+                                      const audio_header_t *h,
+                                      const uint8_t *payload)
+{
+    uint32_t received = s->diag_recv;
+    uint32_t errors = s->lossless_crc_fail + s->lossless_decode_fail + s->lossless_len_fail;
+    uacm_decode_record_packet(s, h, payload);
+    if (s->diag_recv != received) {
+        uint32_t now = uacm_now_ms();
+        if (s->diag_rx_time_valid && s_usb_mic_on) {
+            uint32_t gap = now - s->diag_rx_last_ms;
+            if (gap > s->diag_rx_gap_max_ms) s->diag_rx_gap_max_ms = gap;
+        }
+        s->diag_rx_last_ms = now;
+        s->diag_rx_time_valid = s_usb_mic_on;
+        if (errors != s->lossless_crc_fail + s->lossless_decode_fail + s->lossless_len_fail)
+            s->diag_decode_fail++;
+    }
+}
 
 static void uacm_apply_record_rx_agg_mode(uint8_t disable)
 {
@@ -1942,6 +2023,72 @@ static void uacm_record_task(void *arg)
     }
 }
 
+/* Snapshot only under protection; formatting/UART always outside it.
+ * Counters are cumulative so reconnects cannot underflow interval deltas. */
+static void uacm_diag_rate(char *out, uint32_t lost, uint64_t expected)
+{
+    if (!expected) {
+        strcpy(out, "N/A");
+    } else {
+        uint32_t hundredths = (uint32_t)(((uint64_t)lost * 10000U + expected / 2U) / expected);
+        uint32_t whole = hundredths / 100U;
+        /* Avoid newlib printf/heap dependencies in the firmware image. */
+        if (whole >= 100U) *out++ = '1';
+        if (whole >= 10U) *out++ = (char)('0' + (whole / 10U) % 10U);
+        *out++ = (char)('0' + whole % 10U);
+        *out++ = '.';
+        *out++ = (char)('0' + (hundredths / 10U) % 10U);
+        *out++ = (char)('0' + hundredths % 10U);
+        *out++ = '%';
+        *out = '\0';
+    }
+}
+
+static void uacm_log_audio_diag(void)
+{
+    static uint32_t previous[UACM_SESSION_COUNT][12];
+    uint32_t i;
+    for (i = 0; i < UACM_SESSION_COUNT; ++i) {
+        uacm_session_t *a = &s_session[i];
+        uint32_t current[12], delta[12], j, gap_max;
+        uint32_t play_expected, rec_expected;
+        char play_rate[16], rec_rate[16];
+        uint32_t protection = rtos_protect();
+        current[0] = a->playback_packets;
+        current[1] = a->diag_drop_q;
+        current[2] = a->diag_drop_to;
+        current[3] = a->diag_drop_err;
+        current[4] = a->diag_recv;
+        current[5] = a->seq_gap;
+        current[6] = a->seq_old;
+        current[7] = a->diag_decode_fail;
+        current[8] = a->diag_tx_pkt;
+        current[9] = a->diag_rx_pkt;
+        current[10] = a->diag_tx_busy;
+        current[11] = a->diag_asm_timeout;
+        gap_max = a->diag_rx_gap_max_ms;
+        a->diag_rx_gap_max_ms = 0U;
+        rtos_unprotect(protection);
+        for (j = 0; j < 12U; ++j) {
+            delta[j] = current[j] - previous[i][j];
+            previous[i][j] = current[j];
+        }
+        play_expected = delta[0] + delta[1] + delta[2] + delta[3];
+        rec_expected = delta[4] + delta[5];
+        uacm_diag_rate(play_rate, delta[1] + delta[2] + delta[3], play_expected);
+        uacm_diag_rate(rec_rate, delta[5], rec_expected);
+        dbg("AP T%u PLAY sent=%u/%u drop_q=%u drop_to=%u drop_err=%u local_loss=%s\n",
+            (unsigned)a->client_id, (unsigned)delta[0], (unsigned)play_expected,
+            (unsigned)delta[1], (unsigned)delta[2], (unsigned)delta[3], play_rate);
+        dbg("AP T%u REC recv=%u/%u missing=%u late=%u decode_fail=%u gap_rate=%s\n",
+            (unsigned)a->client_id, (unsigned)delta[4], (unsigned)rec_expected,
+            (unsigned)delta[5], (unsigned)delta[6], (unsigned)delta[7], rec_rate);
+        dbg("AP T%u UDP tx_pkt=%u rx_pkt=%u tx_busy=%u asm_timeout=%u rx_gap_max_ms=%u\n",
+            (unsigned)a->client_id, (unsigned)delta[8], (unsigned)delta[9],
+            (unsigned)delta[10], (unsigned)delta[11], (unsigned)gap_max);
+    }
+}
+
 static void uacm_network_task(void *arg)
 {
     int fd = -1;
@@ -1971,6 +2118,7 @@ static void uacm_network_task(void *arg)
             int total, free_bytes, minimum;
             rtos_heap_info(&total, &free_bytes, &minimum);
             dbg("UACM HEAP total=%d free=%d min=%d\n", total, free_bytes, minimum);
+            uacm_log_audio_diag();
             last_log = now;
         }
         rtos_task_suspend(fd < 0 ? 100U : UACM_NET_SLEEP_MS);

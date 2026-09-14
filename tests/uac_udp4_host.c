@@ -66,6 +66,7 @@ static void test_sequence(void)
     assert(uacm_track_record_seq(&a, 0) == UINT32_MAX);
     assert(uacm_track_record_seq(&a, 3) == 2);
     assert(uacm_track_record_seq(&a, 2) == UINT32_MAX);
+    assert(a.diag_recv == 4 && a.seq_gap == 2 && a.seq_old == 2);
 }
 
 static void test_mixer(void)
@@ -147,6 +148,7 @@ static void test_sessions(void)
         mock_len = sizeof(uh) + sizeof(packet); mock_pending = 1;
         assert(!uacm_poll_udp(7, 2)); assert(mock_audio == 1);
         mock_pending = 1; assert(!uacm_poll_udp(7, 2)); assert(mock_audio == 1);
+        assert(a[3].diag_rx_pkt == 2); /* duplicate is still a received datagram */
         uh.seq = h.seq_num = 2;
         memcpy(mock_wire, &uh, sizeof(uh)); memcpy(mock_wire + sizeof(uh), &h, sizeof(h));
         mock_peer.sin_port++; mock_pending = 1;
@@ -175,6 +177,29 @@ static void test_sessions(void)
     for (i = 0; i < 4; ++i) assert(a[i].playback_fd < 0);
 }
 
+static void test_diag_timeout(void)
+{
+    uacm_session_t a[UACM_SESSION_COUNT] = {0};
+    unsigned i;
+    s_session = a;
+    for (i = 0; i < UACM_SESSION_COUNT; ++i)
+        a[i].record_fd = a[i].playback_fd = -1;
+    a[0].assembly.valid = 1;
+    a[0].assembly.total = 1941;
+    a[0].assembly.mask = 1;
+    a[0].assembly.started_ms = 100;
+    mock_now = 131; mock_pending = 0;
+    assert(!uacm_poll_udp(7, 2));
+    assert(a[0].diag_asm_timeout == 1);
+    mock_now++;
+    assert(!uacm_poll_udp(7, 2));
+    assert(a[0].diag_asm_timeout == 1);
+    a[0].assembly.mask = 3;
+    a[0].diag_asm_expired = 0;
+    assert(!uacm_poll_udp(7, 2));
+    assert(a[0].diag_asm_timeout == 1); /* completed assembly never times out */
+}
+
 static void test_send(void)
 {
     uacm_session_t a = {0};
@@ -191,6 +216,7 @@ static void test_send(void)
     mock_now = 119;
     assert(!uacm_service_tx(&a, 118));
     assert(!a.tx_len && a.playback_drop == 1 && a.playback_fd == 7);
+    assert(a.diag_drop_to == 1 && a.diag_tx_busy == 2);
     mock_send_errno = 0; a.tx_kind = UACM_TX_KIND_PCM;
     a.tx_len = 1941; a.tx_progress_ms = mock_now;
     assert(!uacm_service_tx(&a, 119));
@@ -201,15 +227,31 @@ static void test_send(void)
     mock_now++;
     assert(!uacm_service_tx(&a, 119));
     assert(!a.tx_len && !a.tx_off && a.playback_packets == 1 && mock_sent_len == 957);
+    assert(a.diag_tx_pkt == 2);
     memcpy(&uh, mock_sent, sizeof(uh));
     assert(uh.offset == 1000);
     assert(uac_udp_assemble(&assembly, rebuilt, &uh, mock_sent+sizeof(uh), 941, 120) == 1941);
     assert(!memcmp(rebuilt, a.tx_wire, sizeof(rebuilt)));
+    a.tx_ring.write_pos = 1920;
+    a.tx_len = 1941;
+    a.tx_kind = UACM_TX_KIND_PCM;
+    uacm_close_playback(&a);
+    assert(a.diag_drop_err == 2);
+    uacm_close_playback(&a);
+    assert(a.diag_drop_err == 2); /* cleanup cannot count the same frame twice */
 }
 
 int main(void)
 {
-    test_transport(); test_codec(); test_sequence(); test_mixer(); test_sessions(); test_send();
+    char rate[16];
+    uacm_diag_rate(rate, 4, 1000);
+    assert(!strcmp(rate, "0.40%"));
+    uacm_diag_rate(rate, 0, 0);
+    assert(!strcmp(rate, "N/A"));
+    uacm_diag_rate(rate, 1000, 1000);
+    assert(!strcmp(rate, "100.00%"));
+    test_transport(); test_codec(); test_sequence(); test_mixer(); test_sessions();
+    test_diag_timeout(); test_send();
     puts("PASS: UDP fragments/reorder/duplicates/timeout/bounds/wrap; codec/CRC; four-source mix; registration/pinning/expiry/reconnect; TX fragments/stale drop");
     return 0;
 }

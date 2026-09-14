@@ -22,6 +22,7 @@ def function(name):
     return src[match.start():pos] + '\n'
 
 prefix = '''#include <stdint.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 #define NX_REMOTE_STA_MAX 8
@@ -40,7 +41,7 @@ globals_ = '''static uacm_session_t *s_session;
 static uint32_t s_mix_zero_blocks, s_mix_fallback_blocks, s_mix_dual_blocks;
 '''
 functions = ''.join(function(n) for n in [
-    'uacm_track_record_seq', 'uacm_block_power', 'uacm_ema_u64',
+    'uacm_diag_rate', 'uacm_track_record_seq', 'uacm_block_power', 'uacm_ema_u64',
     'uacm_update_vad', 'uacm_smooth_gain', 'uacm_sat_s16', 'uacm_mix_pcm'])
 network = (root / 'tests/uac_udp4_net_mocks.h').read_text() + ''.join(function(n) for n in [
     'uacm_barrier', 'uacm_ring_reset', 'uacm_rx_lock', 'uacm_rx_unlock',

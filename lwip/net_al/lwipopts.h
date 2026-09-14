@@ -41,6 +41,7 @@
 uint16_t fhost_ip_chksum(const void *dataptr, int len);
 
 #define LWIP_NETIF_API                1
+#define LWIP_SO_RCVBUF 1
 
 /* Two playback and two record TCP streams plus hostapd control traffic need
  * more than the SDK's ten-message tcpip mailbox during short bursts. */
