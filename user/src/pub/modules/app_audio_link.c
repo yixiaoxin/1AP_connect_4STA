@@ -1,9 +1,10 @@
 /*
- * Triangle microphone STA transport for the two-microphone Receiver AP.
- * Build this same source twice with TRIANGLE_DEVICE_ID=1 and =2.
+ * Triangle microphone STA transport for the four-STA UDP Receiver AP.
+ * Build with a unique TRIANGLE_DEVICE_ID in 1..4.
  *
- * TCP/8888: connect, HELLO(id, AP_TO_STA), then receive 10 ms playback PCM.
- * TCP/8890: connect, HELLO(id, STA_TO_AP), then send native 48 kHz stereo recording PCM; REC20 groups two 10 ms BPK2 subframes into one 20 ms application packet when compression fits.
+ * UDP/8888: periodic HELLO/ACK registration, then ADU1 playback fragments.
+ * UDP/8890: independent HELLO/ACK registration and ADU1 recording fragments.
+ * Native 48 kHz stereo BPK2/REC20 and raw fallback match the AP codec.
  */
 
 #include <stdint.h>
@@ -24,7 +25,7 @@
 #include "us_ticker_api.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "lwip/tcp.h"
+#include "uac_udp_transport.h"
 
 #if PLF_WIFI_STACK
 #include "ipc_host.h"
@@ -32,27 +33,7 @@
 
 #include "app_audio_link.h"
 
-/* REC20PPS1: keep the existing 48 kHz/10 ms UAC source blocks and native 48 kHz wire,
- * but coalesce two independently lossless 10 ms BPK2 subframes into one 20 ms
- * application packet.  This halves the normal record application packet rate
- * from 100 pps to 50 pps without requiring a 3840-byte AP decode scratch.  Override only the
- * record-wire geometry here so this drop-in source remains compatible with
- * projects whose unchanged app_audio_link.h still carries the old 16 kHz
- * 160-frame/640-byte staging constants. */
-#ifdef APP_AUDIO_LINK_RECORD_WIRE_FRAMES
-#undef APP_AUDIO_LINK_RECORD_WIRE_FRAMES
-#endif
-#ifdef APP_AUDIO_LINK_RECORD_WIRE_SAMPLES
-#undef APP_AUDIO_LINK_RECORD_WIRE_SAMPLES
-#endif
-#ifdef APP_AUDIO_LINK_RECORD_WIRE_BYTES
-#undef APP_AUDIO_LINK_RECORD_WIRE_BYTES
-#endif
-#define APP_AUDIO_LINK_RECORD_WIRE_FRAMES    480U
-#define APP_AUDIO_LINK_RECORD_WIRE_SAMPLES   (APP_AUDIO_LINK_RECORD_WIRE_FRAMES * APP_AUDIO_LINK_UAC_CHANNELS)
-#define APP_AUDIO_LINK_RECORD_WIRE_BYTES     (APP_AUDIO_LINK_RECORD_WIRE_SAMPLES * sizeof(int16_t))
-
-#define TRI_VERSION                         "v7.0.12R18-P10-RXBYP1-LL3-BPK2-48PREP1-CPUDIAG3-UARTSAFE2-PBUF3-HOSTBUF2-JCTRL3-NETDIAG2-PLAYFIX2-REC48-REC20PPS1-BUF20"
+#define TRI_VERSION                         "v8.0-UDP4-BPK2-REC48-REC20-BUF20"
 #define TRI_TASK_STACK                      4096U
 #define TRI_RECORD_TASK_STACK               4096U
 #define TRI_TASK_PRIO                       2U
@@ -78,8 +59,8 @@
 #define TRI_RX_TIMELOCK_LOW_BYTES            (TRI_RX_TIMELOCK_LOW_PACKETS * TRI_PLAYBACK_WIRE_BYTES)
 #define TRI_RX_TIMELOCK_HIGH_BYTES           (TRI_RX_TIMELOCK_HIGH_PACKETS * TRI_PLAYBACK_WIRE_BYTES)
 #define TRI_PLAYBACK_FADE_FRAMES            144U /* PLAYFIX1: 3 ms at 48 kHz; underflow/rebuffer boundary only */
-#define TRI_PLAYBACK_RX_BUDGET              2U
-#define TRI_RX_STREAM_BYTES                 ((sizeof(audio_header_t) + TRI_PLAYBACK_WIRE_BYTES) * 2U)
+#define TRI_PLAYBACK_RX_BUDGET              8U
+#define TRI_RX_STREAM_BYTES                 UAC_UDP_MAX_FRAME
 #define TRI_HEARTBEAT_MS                    1000U
 #define TRI_UNSENT_STALE_DROP_MS             20U
 #define TRI_PARTIAL_STALL_MS                500U
@@ -183,6 +164,8 @@ typedef char tri_record_rate_byte_check[(APP_AUDIO_LINK_RECORD_WIRE_BYTES == 192
 #endif
 typedef char tri_record_source_frame_check[(APP_AUDIO_LINK_RECORD_SOURCE_FRAMES == 480U) ? 1 : -1];
 typedef char tri_record_source_sample_check[(APP_AUDIO_LINK_RECORD_SOURCE_SAMPLES == 960U) ? 1 : -1];
+typedef char tri_udp_frame_size_check[
+    (sizeof(audio_header_t) + APP_AUDIO_LINK_RECORD_WIRE_BYTES <= UAC_UDP_MAX_FRAME) ? 1 : -1];
 
 typedef struct {
     int16_t pcm[APP_AUDIO_LINK_UAC_SAMPLES_PER_PKT];
@@ -195,7 +178,8 @@ static volatile uint8_t s_stop;
 static volatile uint8_t s_wifi_connected;
 static volatile uint8_t s_play_connected;
 static volatile uint8_t s_record_connected;
-static volatile uint8_t s_mic_streaming = 1U;
+static volatile uint8_t s_mic_streaming;
+static volatile uint8_t s_record_reset_pending;
 static volatile uint8_t s_tx_agg_update_pending = 1U;
 static uint8_t s_tx_agg_disabled;
 static rtos_task_handle s_task;
@@ -218,7 +202,15 @@ static uint32_t s_rx_pcm_count;
 static uint8_t s_rx_started;
 
 static uint8_t s_rx_stream[TRI_RX_STREAM_BYTES] __attribute__((aligned(4)));
-static uint16_t s_rx_len;
+static uac_udp_assembly_t s_rx_assembly;
+typedef struct {
+    uint64_t token;
+    uint32_t hello_ms;
+    uint32_t ack_ms;
+    uint8_t acked;
+} tri_udp_session_t;
+/* Each direction and its socket are owned by exactly one task. */
+static tri_udp_session_t s_udp_session[2];
 static uint8_t s_rx_seq_valid;
 static uint32_t s_rx_last_seq;
 
@@ -515,59 +507,66 @@ static void tri_close(int *fd)
     }
 }
 
-static int tri_send_all(int fd, const uint8_t *buf, uint32_t len)
+static int tri_udp_temporary_error(void)
 {
-    uint32_t off = 0U;
-    while (off < len) {
-        int n = send(fd, buf + off, len - off, 0);
-        if (n <= 0) {
-            return -1;
-        }
-        off += (uint32_t)n;
-    }
-    return 0;
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ||
+           errno == ENOMEM
+#ifdef ENOBUFS
+           || errno == ENOBUFS
+#endif
+           ;
 }
 
+/* UDP connect only selects/filters the AP endpoint; HELLO ACK establishes
+ * application readiness. No TCP handshake or stream socket options. */
 static int tri_connect(uint16_t port, const char *name)
 {
     struct sockaddr_in addr;
-    int fd;
-    int nodelay = 1;
-    int sockbuf = (port == APP_AUDIO_LINK_UAC_RETURN_SERVER_PORT) ?
-                  (int)TRI_RECORD_SOCKET_BUF_BYTES :
-                  (int)TRI_SOCKET_BUF_BYTES;
-
-    fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    uint8_t direction = port == APP_AUDIO_LINK_UAC_SERVER_PORT ?
+        APP_AUDIO_LINK_DIRECTION_AP_TO_STA : APP_AUDIO_LINK_DIRECTION_STA_TO_AP;
+    tri_udp_session_t *session = &s_udp_session[direction - 1U];
+#if LWIP_SO_RCVBUF
+    int sockbuf = direction == APP_AUDIO_LINK_DIRECTION_AP_TO_STA ?
+        TRI_SOCKET_BUF_BYTES : TRI_RECORD_SOCKET_BUF_BYTES;
+#endif
+    (void)name;
+    if (fd < 0) return -1;
+#if LWIP_SO_RCVBUF
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sockbuf, sizeof(sockbuf)) < 0) {
+        close(fd);
         return -1;
     }
-    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
-                     (const char *)&nodelay, sizeof(nodelay));
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
-                     (const char *)&sockbuf, sizeof(sockbuf));
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
-                     (const char *)&sockbuf, sizeof(sockbuf));
+#endif
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = inet_addr(APP_AUDIO_LINK_SERVER_IP);
-    (void)name;
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);
         return -1;
     }
+    {
+        uint64_t token = tri_time_us();
+        if (token <= session->token) token = session->token + 1U;
+        memset(session, 0, sizeof(*session));
+        session->token = token;
+    }
+    if (direction == APP_AUDIO_LINK_DIRECTION_AP_TO_STA)
+        memset(&s_rx_assembly, 0, sizeof(s_rx_assembly));
     return fd;
 }
 
-static int tri_send_hello(int fd, uint8_t direction)
+static int tri_udp_send_hello(int fd, uint8_t direction)
 {
     uint8_t buf[sizeof(audio_header_t) + sizeof(audio_ctrl_payload_t)];
     audio_header_t h;
     audio_ctrl_payload_t ctrl;
-
+    int n;
+    tri_udp_session_t *session = &s_udp_session[direction - 1U];
     h.magic = APP_AUDIO_LINK_PACKET_MAGIC;
-    h.seq_num = 0U;
-    h.timestamp = tri_time_us();
+    h.seq_num = 0U; /* HELLO never consumes an audio sequence number. */
+    h.timestamp = session->token;
     h.packet_type = APP_AUDIO_LINK_PACKET_TYPE_CTRL;
     h.direction = direction;
     h.client_id = TRIANGLE_DEVICE_ID;
@@ -577,7 +576,50 @@ static int tri_send_hello(int fd, uint8_t direction)
     ctrl.reserved = 0U;
     memcpy(buf, &h, sizeof(h));
     memcpy(buf + sizeof(h), &ctrl, sizeof(ctrl));
-    return tri_send_all(fd, buf, sizeof(buf));
+    session->hello_ms = tri_now_ms();
+    n = send(fd, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n == sizeof(buf)) return 0;
+    return n < 0 && tri_udp_temporary_error() ? 0 : -1;
+}
+
+static int tri_udp_accept_ack(const uint8_t *wire, int n, uint8_t direction)
+{
+    audio_header_t h;
+    audio_ctrl_payload_t ctrl;
+    tri_udp_session_t *session = &s_udp_session[direction - 1U];
+    if (n != sizeof(h) + sizeof(ctrl)) return 0;
+    memcpy(&h, wire, sizeof(h));
+    memcpy(&ctrl, wire + sizeof(h), sizeof(ctrl));
+    if (h.magic != APP_AUDIO_LINK_PACKET_MAGIC ||
+        h.packet_type != APP_AUDIO_LINK_PACKET_TYPE_CTRL ||
+        h.direction != direction || h.client_id != TRIANGLE_DEVICE_ID ||
+        h.data_len != sizeof(ctrl) || h.seq_num != 0U ||
+        h.timestamp != session->token ||
+        ctrl.ctrl_type != APP_AUDIO_LINK_CTRL_SESSION_HELLO ||
+        ctrl.value != TRIANGLE_DEVICE_ID || ctrl.reserved) return 0;
+    session->ack_ms = tri_now_ms();
+    session->acked = 1U;
+    return 1;
+}
+
+/* Initial registration retries the same token/socket. Allows the AP's old
+ * 3-second ID lease to expire after a reboot before declaring failure. */
+static int tri_send_hello(int fd, uint8_t direction)
+{
+    uint32_t start = tri_now_ms();
+    tri_udp_session_t *session = &s_udp_session[direction - 1U];
+    uint8_t wire[sizeof(audio_header_t) + sizeof(audio_ctrl_payload_t) + 1U];
+    if (tri_udp_send_hello(fd, direction) < 0) return -1;
+    while (!s_stop && wlan_get_connect_status() &&
+           tri_now_ms() - start < TRI_CONNECT_TIMEOUT_MS) {
+        int n = recv(fd, wire, sizeof(wire), MSG_DONTWAIT);
+        if (n >= 0 && tri_udp_accept_ack(wire, n, direction)) return 0;
+        if (n < 0 && !tri_udp_temporary_error()) return -1;
+        if (tri_now_ms() - session->hello_ms >= TRI_HEARTBEAT_MS &&
+            tri_udp_send_hello(fd, direction) < 0) return -1;
+        rtos_task_suspend(TRI_LOOP_MS);
+    }
+    return -1;
 }
 
 static void tri_record_decimator_reset(void)
@@ -794,7 +836,7 @@ static void tri_rx_queue_reset(void)
     if (s_rx_mutex != NULL) {
         rtos_mutex_unlock(s_rx_mutex);
     }
-    s_rx_len = 0U;
+    memset(&s_rx_assembly, 0, sizeof(s_rx_assembly));
     s_rx_seq_valid = 0U;
     s_play_last_ap_seq = 0U;
     s_play_last_ap_timestamp_ms = 0U;
@@ -1236,12 +1278,13 @@ static void tri_handle_rx(const audio_header_t *h, const uint8_t *payload)
         (h->data_len >= sizeof(audio_ctrl_payload_t))) {
         audio_ctrl_payload_t ctrl;
         memcpy(&ctrl, payload, sizeof(ctrl));
-        if (ctrl.ctrl_type == APP_AUDIO_LINK_CTRL_UAC_MIC_STREAMING) {
+        if (ctrl.ctrl_type == APP_AUDIO_LINK_CTRL_UAC_MIC_STREAMING ||
+            ctrl.ctrl_type == APP_AUDIO_LINK_CTRL_HEARTBEAT) {
             uint8_t new_streaming = ctrl.value ? 1U : 0U;
             if (new_streaming != s_mic_streaming) {
                 s_mic_streaming = new_streaming;
                 if (!s_mic_streaming) {
-                    tri_tx_queue_reset();
+                    s_record_reset_pending = 1U;
                 }
                 dbg("TRI%u USB record request %s\n",
                     (unsigned)TRIANGLE_DEVICE_ID,
@@ -1294,73 +1337,69 @@ static void tri_handle_rx(const audio_header_t *h, const uint8_t *payload)
     }
 }
 
-static void tri_parse_rx(void)
+/* Receive whole datagrams. The connected UDP socket filters source IP/port;
+ * validate identity, direction, session ACK and both audio headers here. */
+static int tri_service_udp_rx(int fd, uint8_t direction)
 {
-    while (s_rx_len >= sizeof(audio_header_t)) {
+    uint8_t wire[sizeof(uac_udp_header_t) + UAC_UDP_CHUNK + 1U];
+    uint32_t budget = TRI_PLAYBACK_RX_BUDGET;
+    tri_udp_session_t *session = &s_udp_session[direction - 1U];
+    /* A late ACK must not revive an expired lease with stale audio state. */
+    if (!session->acked ||
+        tri_now_ms() - session->ack_ms >= UAC_UDP_PEER_TIMEOUT_MS) return -1;
+    if (tri_now_ms() - session->hello_ms >= TRI_HEARTBEAT_MS &&
+        tri_udp_send_hello(fd, direction) < 0) return -1;
+    while (budget-- > 0U) {
+        uint32_t magic;
         audio_header_t h;
-        uint32_t packet_len;
-        memcpy(&h, s_rx_stream, sizeof(h));
-        if (h.magic != APP_AUDIO_LINK_PACKET_MAGIC) {
-            memmove(s_rx_stream, s_rx_stream + 1, s_rx_len - 1U);
-            s_rx_len--;
-            continue;
+        int n = recv(fd, wire, sizeof(wire), MSG_DONTWAIT);
+        if (n < 0) {
+            if (tri_udp_temporary_error()) break;
+            return -1;
         }
-        if (h.data_len > TRI_PLAYBACK_WIRE_BYTES) {
-            s_play_rx_drop++;
-            s_rx_len = 0U;
-            return;
+        if (tri_udp_accept_ack(wire, n, direction)) continue;
+        if (direction != APP_AUDIO_LINK_DIRECTION_AP_TO_STA ||
+            n < sizeof(magic)) continue;
+        memcpy(&magic, wire, sizeof(magic));
+        if (magic == APP_AUDIO_LINK_PACKET_MAGIC &&
+            n == sizeof(h) + sizeof(audio_ctrl_payload_t)) {
+            audio_ctrl_payload_t ctrl;
+            memcpy(&h, wire, sizeof(h));
+            memcpy(&ctrl, wire + sizeof(h), sizeof(ctrl));
+            if (h.packet_type != APP_AUDIO_LINK_PACKET_TYPE_CTRL ||
+                h.direction != direction || h.client_id != TRIANGLE_DEVICE_ID ||
+                h.data_len != sizeof(ctrl) || ctrl.reserved ||
+                (ctrl.ctrl_type != APP_AUDIO_LINK_CTRL_UAC_MIC_STREAMING &&
+                 ctrl.ctrl_type != APP_AUDIO_LINK_CTRL_HEARTBEAT)) continue;
+            tri_handle_rx(&h, wire + sizeof(h));
+        } else if (magic == UAC_UDP_MAGIC &&
+                   n > sizeof(uac_udp_header_t) && n < sizeof(wire)) {
+            uac_udp_header_t uh;
+            int complete;
+            memcpy(&uh, wire, sizeof(uh));
+            if (uh.client_id != TRIANGLE_DEVICE_ID || uh.direction != direction)
+                continue;
+            complete = uac_udp_assemble(&s_rx_assembly, s_rx_stream, &uh,
+                wire + sizeof(uh), n - sizeof(uh), tri_now_ms());
+            if (complete <= 0) continue;
+            memcpy(&h, s_rx_stream, sizeof(h));
+            if (h.magic != APP_AUDIO_LINK_PACKET_MAGIC ||
+                h.seq_num != uh.seq || h.client_id != uh.client_id ||
+                h.direction != direction || sizeof(h) + h.data_len != complete ||
+                (h.packet_type != APP_AUDIO_LINK_PACKET_TYPE_UAC_PCM &&
+                 h.packet_type != TRI_PACKET_TYPE_UAC_PCM_LOSSLESS)) continue;
+            tri_handle_rx(&h, s_rx_stream + sizeof(h));
         }
-        packet_len = sizeof(h) + h.data_len;
-        if (s_rx_len < packet_len) {
-            return;
-        }
-        tri_handle_rx(&h, s_rx_stream + sizeof(h));
-        if (s_rx_len > packet_len) {
-            memmove(s_rx_stream, s_rx_stream + packet_len,
-                    s_rx_len - packet_len);
-        }
-        s_rx_len = (uint16_t)(s_rx_len - packet_len);
     }
+    /* Audio/control traffic alone does not renew the registration lease. */
+    return !session->acked ||
+        tri_now_ms() - session->ack_ms >= UAC_UDP_PEER_TIMEOUT_MS ? -1 : 0;
 }
 
 static int tri_service_playback_rx(int fd)
 {
-    /* Bound playback RX work during full duplex.  A single recv may already
-     * contain multiple 10 ms frames; do not let AP->STA bursts starve the
-     * record TX service path. */
-    uint32_t budget = TRI_PLAYBACK_RX_BUDGET;
-    while (budget-- > 0U) {
-        uint32_t free_bytes;
-        int n;
-        tri_parse_rx();
-        free_bytes = sizeof(s_rx_stream) - s_rx_len;
-        if (free_bytes == 0U) {
-            s_rx_len = 0U;
-            s_play_rx_drop++;
-            free_bytes = sizeof(s_rx_stream);
-        }
-        n = recv(fd, s_rx_stream + s_rx_len, free_bytes, MSG_DONTWAIT);
-        if (n > 0) {
-            s_rx_len = (uint16_t)(s_rx_len + (uint16_t)n);
-            continue;
-        }
-        if (n == 0) {
-            return -1;
-        }
-        if ((errno == EAGAIN) || (errno == EWOULDBLOCK) ||
-            (errno == ENOMEM)
-#ifdef ENOBUFS
-            || (errno == ENOBUFS)
-#endif
-            ) {
-            return 0;
-        }
-        return -1;
-    }
-    tri_parse_rx();
-    return 0;
+    return tri_service_udp_rx(fd, APP_AUDIO_LINK_DIRECTION_AP_TO_STA);
 }
-
 
 /* ================= LL3-BPK2-48PREP1-CPUDIAG1 bounded block lossless codec =================
  * Real-time oriented replacement for FAST1 whole-frame Rice coding.
@@ -1819,32 +1858,9 @@ static void tri_prepare_record_frame(uint32_t now_ms)
     s_tx_off = 0U;
     s_tx_current_pcm = 1U;
     s_tx_current_payload_len = payload_len;
-    s_tx_blocked_since_ms = now_ms;
-    s_tx_blocked = 0U;
-}
-
-static void tri_prepare_heartbeat(uint32_t now_ms)
-{
-    audio_header_t h;
-    audio_ctrl_payload_t ctrl;
-    h.magic = APP_AUDIO_LINK_PACKET_MAGIC;
-    h.seq_num = s_tx_seq++;
-    h.timestamp = tri_time_us();
-    h.packet_type = APP_AUDIO_LINK_PACKET_TYPE_CTRL;
-    h.direction = APP_AUDIO_LINK_DIRECTION_STA_TO_AP;
-    h.client_id = TRIANGLE_DEVICE_ID;
-    h.data_len = sizeof(ctrl);
-    ctrl.ctrl_type = APP_AUDIO_LINK_CTRL_HEARTBEAT;
-    ctrl.value = s_mic_streaming;
-    ctrl.reserved = 0U;
-    memcpy(s_tx_wire, &h, sizeof(h));
-    memcpy(s_tx_wire + sizeof(h), &ctrl, sizeof(ctrl));
-    s_tx_len = (uint16_t)(sizeof(h) + sizeof(ctrl));
-    s_tx_off = 0U;
-    s_tx_current_pcm = 0U;
-    s_tx_current_lossless = 0U;
-    s_tx_current_group_ms = 0U;
-    s_tx_current_payload_len = 0U;
+    /* Pace from frame start: sending fragment two on the next task tick must
+     * not add 1 ms to every 10/20 ms audio interval. */
+    s_next_audio_tx_ms = now_ms + s_tx_current_group_ms;
     s_tx_blocked_since_ms = now_ms;
     s_tx_blocked = 0U;
 }
@@ -1861,13 +1877,35 @@ static int tri_service_record_tx(int fd, uint32_t now_ms)
                 return 0;
             }
             tri_prepare_record_frame(now_ms);
-        } else if ((now_ms - s_last_tx_ms) >= TRI_HEARTBEAT_MS) {
-            tri_prepare_heartbeat(now_ms);
         } else {
             return 0;
         }
     }
-    n = send(fd, s_tx_wire + s_tx_off, s_tx_len - s_tx_off, MSG_DONTWAIT);
+    {
+        uint8_t wire[sizeof(uac_udp_header_t) + UAC_UDP_CHUNK];
+        uac_udp_header_t uh;
+        audio_header_t h;
+        uint32_t bytes = s_tx_len - s_tx_off;
+        if (!s_tx_len || s_tx_len > UAC_UDP_MAX_FRAME ||
+            s_tx_off >= s_tx_len || s_tx_off % UAC_UDP_CHUNK) return -1;
+        if (bytes > UAC_UDP_CHUNK) bytes = UAC_UDP_CHUNK;
+        memcpy(&h, s_tx_wire, sizeof(h));
+        uh.magic = UAC_UDP_MAGIC;
+        uh.seq = h.seq_num;
+        uh.total = s_tx_len;
+        uh.offset = s_tx_off;
+        uh.client_id = TRIANGLE_DEVICE_ID;
+        uh.direction = APP_AUDIO_LINK_DIRECTION_STA_TO_AP;
+        uh.reserved = 0U;
+        memcpy(wire, &uh, sizeof(uh));
+        memcpy(wire + sizeof(uh), s_tx_wire + s_tx_off, bytes);
+        n = send(fd, wire, sizeof(uh) + bytes, MSG_DONTWAIT);
+        if (n >= 0) {
+            if ((uint32_t)n != sizeof(uh) + bytes) return -1;
+            n = (int)bytes;
+        }
+    }
+    now_ms = tri_now_ms();
     if (n > 0) {
         s_tx_off = (uint16_t)(s_tx_off + (uint16_t)n);
         s_tx_blocked_since_ms = now_ms;
@@ -1887,7 +1925,6 @@ static int tri_service_record_tx(int fd, uint32_t now_ms)
                 if (s_tx_current_payload_len > s_lossless_payload_max)
                     s_lossless_payload_max = s_tx_current_payload_len;
                 s_tx_packet_loaded = 0U;
-                s_next_audio_tx_ms = now_ms + ((s_tx_current_group_ms == 20U) ? TRI_RECORD_FRAME_PACE_MS : 10U);
             }
             s_tx_current_pcm = 0U;
             s_tx_current_lossless = 0U;
@@ -1936,14 +1973,11 @@ static int tri_service_record_tx(int fd, uint32_t now_ms)
          * already bounds local latency and safely advances to fresh audio.
          * Reconnecting here caused the observed STA2 close/reconnect storm. */
 
-        if ((s_tx_off == 0U) &&
-            (stall_ms >= TRI_UNSENT_STALE_DROP_MS)) {
+        if (stall_ms >= TRI_UNSENT_STALE_DROP_MS) {
             uint32_t trimmed = 0U;
 
-            /* Safe realtime drop: not one byte of this framed TCP message has
-             * entered lwIP yet, so discarding it cannot corrupt the byte
-             * stream.  Sequence was allocated when the frame was prepared;
-             * the AP will therefore see an intentional gap. */
+            /* Drop the entire stale UDP frame, including an unsent second
+             * fragment. The AP expires partial assembly and sees a seq gap. */
             if (pcm_frame) {
                 s_record_tx_drop++;
                 s_record_stale_drop++;
@@ -1987,22 +2021,6 @@ static int tri_service_record_tx(int fd, uint32_t now_ms)
             return 0;
         }
 
-        if ((s_tx_off > 0U) &&
-            (stall_ms >= TRI_PARTIAL_STALL_MS)) {
-            /* Some bytes already entered TCP.  Dropping only the remainder
-             * would destroy application framing, so reconnect the record
-             * socket and restart from fresh audio instead. */
-            s_record_partial_reset++;
-            s_tx_blocked_since_ms = 0U;
-            s_tx_blocked = 0U;
-            dbg("TRI%u TXPARTIAL reset off=%u/%u stall=%u ms count=%u\n",
-                (unsigned)TRIANGLE_DEVICE_ID,
-                (unsigned)s_tx_off,
-                (unsigned)s_tx_len,
-                (unsigned)stall_ms,
-                (unsigned)s_record_partial_reset);
-            return -1;
-        }
         return 0;
     }
     s_tx_blocked_since_ms = 0U;
@@ -2205,8 +2223,13 @@ static void tri_record_task_fn(void *param)
         }
 
         now_ms = tri_now_ms();
+        if (s_record_reset_pending) {
+            s_record_reset_pending = 0U;
+            tri_tx_queue_reset();
+        }
         if ((record_fd >= 0) &&
-            (tri_service_record_tx(record_fd, now_ms) != 0)) {
+            ((tri_service_udp_rx(record_fd, APP_AUDIO_LINK_DIRECTION_STA_TO_AP) != 0) ||
+             (tri_service_record_tx(record_fd, now_ms) != 0))) {
             tri_close(&record_fd);
             s_record_connected = 0U;
             tri_tx_queue_reset();
@@ -2329,6 +2352,9 @@ static void tri_network_task(void *param)
                     (unsigned)TRIANGLE_DEVICE_ID);
                 tri_close(&play_fd);
                 s_play_connected = 0U;
+                s_mic_streaming = 0U;
+                s_record_reset_pending = 1U;
+                tri_rx_queue_reset();
                 s_wifi_connected = 0U;
                 play_down = play_seen;
             }
@@ -2346,6 +2372,13 @@ static void tri_network_task(void *param)
                             "TRI%u READY WiFi connected\n",
                 (unsigned)TRIANGLE_DEVICE_ID);
             wifi_seen = 1U;
+        }
+
+        /* Wi-Fi may already have been joined by the SDK startup path. */
+        if (!s_wifi_connected && wlan_get_connect_status()) {
+            s_wifi_connected = 1U;
+            user_sleep_allow(0);
+            s_tx_agg_update_pending = 1U;
         }
 
         if (play_fd < 0) {
@@ -2373,6 +2406,8 @@ static void tri_network_task(void *param)
         if ((play_fd >= 0) && (tri_service_playback_rx(play_fd) != 0)) {
             tri_close(&play_fd);
             s_play_connected = 0U;
+            s_mic_streaming = 0U;
+            s_record_reset_pending = 1U;
             tri_rx_queue_reset();
             s_reconnects++;
             if (!play_down) {

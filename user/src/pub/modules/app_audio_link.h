@@ -10,14 +10,14 @@ extern "C" {
 #define APP_AUDIO_LINK_ROLE_STA                  0U
 #define APP_AUDIO_LINK_ROLE_AP                   1U
 #define APP_AUDIO_LINK_ROLE                      APP_AUDIO_LINK_ROLE_STA
-#define APP_AUDIO_LINK_AP_MAX_STA                2U
+#define APP_AUDIO_LINK_AP_MAX_STA                4U
 
 #ifndef TRIANGLE_DEVICE_ID
 #define TRIANGLE_DEVICE_ID                       1U
 #endif
 
-#if (TRIANGLE_DEVICE_ID < 1U) || (TRIANGLE_DEVICE_ID > 2U)
-#error "TRIANGLE_DEVICE_ID must be 1 or 2."
+#if (TRIANGLE_DEVICE_ID < 1U) || (TRIANGLE_DEVICE_ID > 4U)
+#error "TRIANGLE_DEVICE_ID must be in 1..4."
 #endif
 
 #define APP_AUDIO_LINK_SSID                      "aic8800m40"
@@ -40,16 +40,15 @@ extern "C" {
 #define APP_AUDIO_LINK_UAC_WIRE_SAMPLES          480U
 #define APP_AUDIO_LINK_UAC_WIRE_BYTES            960U
 
-/* R18 changes only the Triangle -> AP recording wire packetization.  I2S
- * capture, ARM processing and AP -> Triangle playback remain 48 kHz stereo. */
-#define APP_AUDIO_LINK_RECORD_WIRE_SAMPLE_RATE   16000U
+/* Native 48 kHz stereo recording matches the four-STA UDP AP. */
+#define APP_AUDIO_LINK_RECORD_WIRE_SAMPLE_RATE   48000U
 #define APP_AUDIO_LINK_RECORD_WIRE_PACKET_MS     10U
 #define APP_AUDIO_LINK_RECORD_SOURCE_BLOCKS      1U
 #define APP_AUDIO_LINK_RECORD_SOURCE_FRAMES      (APP_AUDIO_LINK_UAC_FRAMES_PER_PKT * APP_AUDIO_LINK_RECORD_SOURCE_BLOCKS)
 #define APP_AUDIO_LINK_RECORD_SOURCE_SAMPLES     (APP_AUDIO_LINK_RECORD_SOURCE_FRAMES * APP_AUDIO_LINK_UAC_CHANNELS)
-#define APP_AUDIO_LINK_RECORD_WIRE_FRAMES        160U
-#define APP_AUDIO_LINK_RECORD_WIRE_SAMPLES       320U
-#define APP_AUDIO_LINK_RECORD_WIRE_BYTES         640U
+#define APP_AUDIO_LINK_RECORD_WIRE_FRAMES        480U
+#define APP_AUDIO_LINK_RECORD_WIRE_SAMPLES       960U
+#define APP_AUDIO_LINK_RECORD_WIRE_BYTES         1920U
 
 #define APP_AUDIO_LINK_PACKET_MAGIC              0xA55A5AA5U
 #define APP_AUDIO_LINK_DIRECTION_AP_TO_STA       0x01U
@@ -75,6 +74,7 @@ int app_audio_link_ap_send_uac_pcm(const int16_t *pcm_stereo, uint16_t frames);
 int app_audio_link_ap_read_uac_rx_pcm(int16_t *pcm_stereo, uint16_t frames);
 uint8_t app_audio_link_ap_is_uac_connected(void);
 uint8_t app_audio_link_is_sta_connected(void);
+/* Legacy API name: reports both UDP directions registered with HELLO ACK. */
 uint8_t app_audio_link_is_tcp_connected(void);
 uint8_t app_audio_link_is_connected(void);
 uint8_t app_audio_link_get_role(void);

@@ -20,7 +20,7 @@ static void triangle_sta_user_task(void *param)
     rtos_task_suspend(TRIANGLE_STA_ENTRY_DELAY_MS);
 
     /* Fixed STA MAC address, persisted to flash.  Tail byte is derived from
-     * TRIANGLE_DEVICE_ID (1 -> 88:00:33:AA:BB:C1, 2 -> ...:C2) so the two
+     * TRIANGLE_DEVICE_ID (1 -> 88:00:33:AA:BB:C1 through 4 -> ...:C4) so all
      * STAs built from this source do not collide on the same network. */
     {
         uint8_t fixed_mac[6] = {0x88, 0x00, 0x33, 0xAA, 0xBB,
@@ -29,7 +29,7 @@ static void triangle_sta_user_task(void *param)
         flash_wifi_sta_macaddr_write(fixed_mac);
     }
 
-    dbg("TRI%u boot v7.0.12R18: capture/playback 48k stereo, record wire 16k stereo 10ms\r\n",
+    dbg("TRI%u boot UDP4: capture/playback/record 48k stereo, UDP 8888/8890\r\n",
         (unsigned)TRIANGLE_DEVICE_ID);
 
     app_audio_pcm_init();
