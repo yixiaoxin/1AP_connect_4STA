@@ -131,6 +131,29 @@ static void test_sessions(void)
         assert(a[i-1].record_fd == 7 && a[i-1].playback_fd == 7);
     }
     assert(mock_acks == 8);
+    {
+        size_t log_len;
+        uacm_session_t saved[4];
+        uint32_t saved_now = mock_now;
+        const uint8_t ip[4] = {192, 168, 88, 24};
+        memcpy(saved, a, sizeof(saved));
+        mock_now += UAC_UDP_PEER_TIMEOUT_MS;
+        memcpy(&mock_peer.sin_addr.s_addr, ip, sizeof(ip));
+        mock_log[0] = 0;
+        hello(4, 2, 123); hello(4, 1, 123);
+        assert(strstr(mock_log, "T4 record 192.168.88.1->192.168.88.24 (hello,connected)"));
+        assert(strstr(mock_log, "T4 play_back 192.168.88.1->192.168.88.24 (hello,connected)"));
+        log_len = strlen(mock_log);
+        hello(4, 2, 123); hello(4, 1, 123);
+        assert(strlen(mock_log) == log_len); /* keepalive is silent */
+        hello(4, 2, 456);
+        assert(strlen(mock_log) == log_len); /* invalid replacement is silent */
+        /* Restore the session fixture used by the remaining network tests. */
+        mock_peer.sin_addr.s_addr = 4;
+        memcpy(a, saved, sizeof(saved));
+        mock_now = saved_now;
+        mock_acks = 8;
+    }
     hello(5, 2, 123); assert(mock_acks == 8); /* fifth client rejected */
     a[3].rx_ring.write_pos = 100;
     hello(4, 2, 123); /* duplicate HELLO does not flush jitter or seq state */
@@ -243,6 +266,30 @@ static void test_send(void)
 
 int main(void)
 {
+    {
+        uacm_session_t session = {0};
+        size_t logged;
+        session.client_id = 2;
+        session.playback_fd = session.record_fd = -1;
+        mock_log[0] = 0;
+        uacm_close_playback(&session);
+        uacm_close_record(&session);
+        assert(!mock_log[0]); /* initialization is not a disconnect */
+        session.playback_fd = session.record_fd = 7;
+        uacm_close_playback(&session);
+        assert(!strcmp(mock_log, "T2 play_back disconnect\n"));
+        uacm_close_record(&session);
+        assert(!strcmp(mock_log, "T2 play_back disconnect\nT2 record disconnect\n"));
+        logged = strlen(mock_log);
+        uacm_close_playback(&session);
+        uacm_close_record(&session);
+        assert(strlen(mock_log) == logged);
+        session.playback_fd = session.record_fd = 7;
+        uacm_close_playback(&session);
+        uacm_close_record(&session);
+        assert(strlen(mock_log) == logged * 2); /* next session reports again */
+        mock_log[0] = 0;
+    }
     char rate[16];
     uacm_diag_rate(rate, 4, 1000);
     assert(!strcmp(rate, "0.40%"));
@@ -254,24 +301,49 @@ int main(void)
     test_diag_timeout(); test_send();
     {
         uacm_session_t sessions[UACM_SESSION_COUNT] = {0};
+        unsigned j;
+        for (j = 0; j < UACM_SESSION_COUNT; ++j) {
+            sessions[j].client_id = j + 1;
+            sessions[j].playback_fd = sessions[j].record_fd = -1;
+        }
         s_session = sessions;
+        mock_log[0] = 0;
+        sessions[0].playback_fd = sessions[0].record_fd = 7;
+        sessions[0].playback_seen_ms = sessions[0].record_seen_ms = mock_now;
         sessions[0].client_id = 1;
         sessions[0].playback_packets = 996;
         sessions[0].diag_recv = 498;
+        sessions[0].record_packets = 1992;
         uacm_log_audio_diag();
         assert(strstr(mock_log, "PLAY sent=996/1000"));
-        assert(strstr(mock_log, "REC recv=498/500"));
+        assert(strstr(mock_log, "REC recv=1992/2000"));
         assert(strstr(mock_log, "local_loss=0.40%"));
         assert(strstr(mock_log, "gap_rate=0.40%"));
+        assert(strstr(mock_log, "\033[31merro:AP T1 PLAY"));
+        assert(strstr(mock_log, "\033[31merro:AP T1 REC"));
+        assert(strstr(mock_log, "local_loss=0.40%\033[0m\n"));
+        assert(strstr(mock_log, "AP T2 PLAY sent=down\n"));
+        assert(strstr(mock_log, "AP T2 REC recv=down\n"));
+        assert(!strstr(mock_log, "erro:AP T2"));
         assert(strstr(mock_log, "\n==========\nAP T"));
         mock_log[0] = 0;
         sessions[0].playback_packets += 900;
-        sessions[0].diag_recv += 600;
+        /* 614 mixed network frames still represent exactly 2000 PCM blocks. */
+        sessions[0].diag_recv += 386 + 228;
+        sessions[0].record_packets += 386 * 4 + 228 * 2;
         uacm_log_audio_diag();
         assert(strstr(mock_log, "PLAY sent=900/1000"));
         assert(strstr(mock_log, "local_loss=10.00%"));
-        assert(strstr(mock_log, "REC recv=600/500"));
+        assert(strstr(mock_log, "REC recv=2000/2000"));
         assert(strstr(mock_log, "gap_rate=0.00%"));
+        assert(!strstr(mock_log, "erro:AP T1 REC"));
+        mock_log[0] = 0;
+        sessions[0].playback_fd = -1;
+        sessions[0].record_seen_ms = mock_now - UAC_UDP_PEER_TIMEOUT_MS;
+        uacm_log_audio_diag();
+        assert(strstr(mock_log, "AP T1 PLAY sent=down\n"));
+        assert(strstr(mock_log, "AP T1 REC recv=down\n"));
+        assert(!strstr(mock_log, "\033[31m"));
     }
     puts("PASS: UDP fragments/reorder/duplicates/timeout/bounds/wrap; codec/CRC; four-source mix; registration/pinning/expiry/reconnect; TX fragments/stale drop");
     return 0;

@@ -817,6 +817,7 @@ static void uacm_session_audio_reset(uacm_session_t *s)
 
 static void uacm_close_playback(uacm_session_t *s)
 {
+    uint8_t was_connected = s->playback_fd >= 0;
     s->diag_drop_err += (s->tx_ring.write_pos - s->tx_ring.read_pos) /
                        UACM_PLAYBACK_PCM_BYTES;
     if (s->tx_len && s->tx_kind == UACM_TX_KIND_PCM) s->diag_drop_err++;
@@ -832,6 +833,7 @@ static void uacm_close_playback(uacm_session_t *s)
     s->tx_blocked_since_ms = 0U;
     s->tx_last_errno = 0U;
     s->tx_backpressure_count = 0U;
+    if (was_connected) dbg("T%u play_back disconnect\n", (unsigned)s->client_id);
 }
 
 static void uacm_rx_lock(uacm_session_t *s)
@@ -850,6 +852,7 @@ static void uacm_rx_unlock(uacm_session_t *s)
 
 static void uacm_close_record(uacm_session_t *s)
 {
+    uint8_t was_connected = s->record_fd >= 0;
     s->diag_rx_time_valid = 0U;
     s->diag_asm_expired = 0U;
     s->record_fd = -1; /* shared UDP socket remains open */
@@ -868,6 +871,7 @@ static void uacm_close_record(uacm_session_t *s)
     s->active = 0U;
     s->active_hold = 0U;
     uacm_rx_unlock(s);
+    if (was_connected) dbg("T%u record disconnect\n", (unsigned)s->client_id);
 }
 
 static int uacm_init_sessions(void)
@@ -1009,12 +1013,22 @@ static int uacm_poll_udp(int fd, uint8_t direction)
                 (!uacm_same_peer(saved, &peer) || *token != h.timestamp)) continue;
             if (*slot < 0 || now - *last >= UAC_UDP_PEER_TIMEOUT_MS ||
                 *token != h.timestamp || !uacm_same_peer(saved, &peer)) {
+                uint32_t ap_ip = get_ap_ip_addr();
+                const uint8_t *ap = (const uint8_t *)&ap_ip;
+                const uint8_t *sta = (const uint8_t *)&peer.sin_addr.s_addr;
                 if (direction == AUDIO_DIR_AP_TO_STA) uacm_close_playback(a);
                 else uacm_close_record(a);
                 *saved = peer;
                 *token = h.timestamp;
                 *slot = fd;
                 a->reconnects++;
+                /* AP-side registration accepted, not a TCP handshake or
+                 * confirmation that the peer has received our HELLO ACK. */
+                dbg("T%u %s %u.%u.%u.%u->%u.%u.%u.%u (hello,connected)\n",
+                    (unsigned)a->client_id,
+                    direction == AUDIO_DIR_AP_TO_STA ? "play_back" : "record",
+                    (unsigned)ap[0], (unsigned)ap[1], (unsigned)ap[2], (unsigned)ap[3],
+                    (unsigned)sta[0], (unsigned)sta[1], (unsigned)sta[2], (unsigned)sta[3]);
             }
             *last = now;
             if (direction == AUDIO_DIR_AP_TO_STA) {
@@ -2046,7 +2060,7 @@ static void uacm_diag_rate(char *out, uint32_t lost, uint64_t expected)
 
 #define UACM_DIAG_INTERVAL_MS 10000U
 #define UACM_DIAG_PLAY_EXPECTED (UACM_DIAG_INTERVAL_MS / 10U)
-#define UACM_DIAG_REC_EXPECTED  (UACM_DIAG_INTERVAL_MS / 20U)
+#define UACM_DIAG_REC_EXPECTED  (UACM_DIAG_INTERVAL_MS / 5U)
 
 static void uacm_log_audio_diag(void)
 {
@@ -2056,13 +2070,17 @@ static void uacm_log_audio_diag(void)
         uacm_session_t *a = &s_session[i];
         uint32_t current[12], delta[12], j, gap_max;
         uint32_t play_expected, rec_expected;
+        uint8_t play_up, rec_up;
+        uint32_t now = uacm_now_ms();
         char play_rate[16], rec_rate[16];
         uint32_t protection = rtos_protect();
         current[0] = a->playback_packets;
         current[1] = a->diag_drop_q;
         current[2] = a->diag_drop_to;
         current[3] = a->diag_drop_err;
-        current[4] = a->diag_recv;
+        /* Real decoded PCM only: REC20 contributes four blocks, REC10 two.
+         * PLC-generated blocks do not increment record_packets. */
+        current[4] = a->record_packets;
         current[5] = a->seq_gap;
         current[6] = a->seq_old;
         current[7] = a->diag_decode_fail;
@@ -2070,6 +2088,10 @@ static void uacm_log_audio_diag(void)
         current[9] = a->diag_rx_pkt;
         current[10] = a->diag_tx_busy;
         current[11] = a->diag_asm_timeout;
+        play_up = a->playback_fd >= 0 &&
+                  now - a->playback_seen_ms < UAC_UDP_PEER_TIMEOUT_MS;
+        rec_up = a->record_fd >= 0 &&
+                 now - a->record_seen_ms < UAC_UDP_PEER_TIMEOUT_MS;
         gap_max = a->diag_rx_gap_max_ms;
         a->diag_rx_gap_max_ms = 0U;
         rtos_unprotect(protection);
@@ -2079,19 +2101,34 @@ static void uacm_log_audio_diag(void)
         }
         /* Fixed nominal 10-second targets, NOT inferred from received seqs.
          * These rates measure throughput shortfall, including idle periods.
-         * REC10 fallback can exceed the nominal REC20 target; clamp at 0%. */
+         * Recording uses 5 ms PCM blocks regardless of network grouping.
+         * Window-boundary bursts can exceed the target; clamp at 0%. */
         play_expected = UACM_DIAG_PLAY_EXPECTED;
         rec_expected = UACM_DIAG_REC_EXPECTED;
         uacm_diag_rate(play_rate, delta[0] < play_expected ? play_expected - delta[0] : 0U,
                        play_expected);
         uacm_diag_rate(rec_rate, delta[4] < rec_expected ? rec_expected - delta[4] : 0U,
                        rec_expected);
-        dbg("AP T%u PLAY sent=%u/%u drop_q=%u drop_to=%u drop_err=%u local_loss=%s\n",
-            (unsigned)a->client_id, (unsigned)delta[0], (unsigned)play_expected,
-            (unsigned)delta[1], (unsigned)delta[2], (unsigned)delta[3], play_rate);
-        dbg("AP T%u REC recv=%u/%u missing=%u late=%u decode_fail=%u gap_rate=%s\n",
-            (unsigned)a->client_id, (unsigned)delta[4], (unsigned)rec_expected,
-            (unsigned)delta[5], (unsigned)delta[6], (unsigned)delta[7], rec_rate);
+        if (!play_up) {
+            dbg("AP T%u PLAY sent=down\n", (unsigned)a->client_id);
+        } else {
+            uint8_t error = delta[0] < play_expected;
+            dbg("%sAP T%u PLAY sent=%u/%u drop_q=%u drop_to=%u drop_err=%u local_loss=%s%s\n",
+                error ? "\033[31merro:" : "", (unsigned)a->client_id,
+                (unsigned)delta[0], (unsigned)play_expected,
+                (unsigned)delta[1], (unsigned)delta[2], (unsigned)delta[3], play_rate,
+                error ? "\033[0m" : "");
+        }
+        if (!rec_up) {
+            dbg("AP T%u REC recv=down\n", (unsigned)a->client_id);
+        } else {
+            uint8_t error = delta[4] < rec_expected;
+            dbg("%sAP T%u REC recv=%u/%u missing=%u late=%u decode_fail=%u gap_rate=%s%s\n",
+                error ? "\033[31merro:" : "", (unsigned)a->client_id,
+                (unsigned)delta[4], (unsigned)rec_expected,
+                (unsigned)delta[5], (unsigned)delta[6], (unsigned)delta[7], rec_rate,
+                error ? "\033[0m" : "");
+        }
         dbg("AP T%u UDP tx_pkt=%u rx_pkt=%u tx_busy=%u asm_timeout=%u rx_gap_max_ms=%u\n",
             (unsigned)a->client_id, (unsigned)delta[8], (unsigned)delta[9],
             (unsigned)delta[10], (unsigned)delta[11], (unsigned)gap_max);

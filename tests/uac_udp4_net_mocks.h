@@ -24,6 +24,13 @@ static void dbg(const char *format, ...)
     va_end(args);
 }
 static uint32_t uacm_now_ms(void) { return mock_now; }
+static uint32_t get_ap_ip_addr(void)
+{
+    const uint8_t bytes[4] = {192, 168, 88, 1};
+    uint32_t address;
+    memcpy(&address, bytes, sizeof(address));
+    return address;
+}
 static uint64_t uacm_time_us(void) { return (uint64_t)mock_now * 1000; }
 /* TX tests seed an already-encoded frame; codec itself is tested separately. */
 static int uacm_prepare_pcm(uacm_session_t *s) { (void)s; return -1; }
