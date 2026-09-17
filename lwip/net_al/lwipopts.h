@@ -155,9 +155,9 @@ uint16_t fhost_ip_chksum(const void *dataptr, int len);
  * about three 1920-byte audio frames plus retransmit headroom) so an example
  * single connection's kernel send window can never fill the heap.
  *
- * MEMP_NUM_TCP_SEG / MEMP_NUM_PBUF / TCP_SNDLOWAT / MEM_MIN_TCP all derive
- * from this macro and shrink automatically; MEM_SIZE stays 0x4000 (16 KB).
- * This frees ~3.3 KB of BSS from the TCP_SEG + PBUF pools.
+ * MEMP_NUM_TCP_SEG and TCP_SNDLOWAT still derive from TCP_SND_BUF.
+ * The AP UDP PBUF_REF/ROM descriptor pool is sized independently below;
+ * increasing that pool does not increase the TCP send window.
  */
 #define TCP_SND_BUF                   8192
 #define TCP_QUEUE_OOSEQ               1
@@ -170,7 +170,16 @@ uint16_t fhost_ip_chksum(const void *dataptr, int len);
  * Pin the queue length to the tcp_seg pool so the two always match and the
  * send queue can never demand more segments than have been allocated. */
 #define TCP_SND_QUEUELEN              MEMP_NUM_TCP_SEG
-#if !defined(CFG_RAM_OPT) && defined(CONFIG_RWNX_LWIP) && defined(CFG_HOSTIF)
+#if defined(CFG_SOFTAP) || defined(CFG_HOSTAPD)
+/* Four-STA UDP: the old TCP-derived pool had only 11 descriptors and
+ * exhausted during peer power loss. 32 is a measured-test starting point,
+ * not a per-peer quota; retain pool diagnostics to validate headroom.
+ * This sizes MEMP_PBUF (PBUF_REF/ROM), NOT PBUF_POOL payload storage. */
+#ifndef AP_UDP_PBUF_COUNT
+#define AP_UDP_PBUF_COUNT             32
+#endif
+#define MEMP_NUM_PBUF                 AP_UDP_PBUF_COUNT
+#elif !defined(CFG_RAM_OPT) && defined(CONFIG_RWNX_LWIP) && defined(CFG_HOSTIF)
 #define MEMP_NUM_PBUF                 ((4 * TCP_SND_BUF) / TCP_MSS)
 #else /* CONFIG_RWNX_LWIP && CFG_HOSTIF */
 #define MEMP_NUM_PBUF                 ((2 * TCP_SND_BUF) / TCP_MSS)

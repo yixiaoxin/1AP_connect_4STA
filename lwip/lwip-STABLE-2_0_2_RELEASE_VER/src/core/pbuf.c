@@ -110,6 +110,7 @@ void eth_rx_irq()
  */
 
 #include "lwip/opt.h"
+#include "lwip/alloc_diag.h"
 
 #include "lwip/stats.h"
 #include "lwip/def.h"
@@ -285,6 +286,7 @@ pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
     p = (struct pbuf *)memp_malloc(MEMP_PBUF_POOL);
     LWIP_DEBUGF(PBUF_DEBUG | LWIP_DBG_TRACE, ("pbuf_alloc: allocated pbuf %p\n", (void *)p));
     if (p == NULL) {
+      LWIP_ALLOC_FAIL("pbuf_pool_head", length);
       PBUF_POOL_IS_EMPTY();
       return NULL;
     }
@@ -317,6 +319,7 @@ pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
     while (rem_len > 0) {
       q = (struct pbuf *)memp_malloc(MEMP_PBUF_POOL);
       if (q == NULL) {
+        LWIP_ALLOC_FAIL("pbuf_pool_tail", rem_len);
         PBUF_POOL_IS_EMPTY();
         /* free chain so far allocated */
         pbuf_free(p);
@@ -363,6 +366,7 @@ pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
     }
 
     if (p == NULL) {
+      LWIP_ALLOC_FAIL("pbuf_ram", length);
       return NULL;
     }
     /* Set up internal structure of the pbuf. */
@@ -381,6 +385,7 @@ pbuf_alloc(pbuf_layer layer, u16_t length, pbuf_type type)
     /* only allocate memory for the pbuf structure */
     p = (struct pbuf *)memp_malloc(MEMP_PBUF);
     if (p == NULL) {
+      LWIP_ALLOC_FAIL("pbuf_descriptor", length);
       LWIP_DEBUGF(PBUF_DEBUG | LWIP_DBG_LEVEL_SERIOUS,
                   ("pbuf_alloc: Could not allocate MEMP_PBUF for PBUF_%s.\n",
                   (type == PBUF_ROM) ? "ROM" : "REF"));

@@ -358,11 +358,16 @@ static const struct {
     #endif
 };
 
-#if PLF_WIFI_AUDIO
+#if PLF_WIFI_AUDIO || (defined(CFG_SOFTAP) && defined(CFG_USB_DEVICE))
+/* This SoftAP USB audio bridge also needs a short lifetime for queued Wi-Fi
+ * frames. Its build does not enable CFG_WIFI_AUDIO, so the old default was
+ * 1000 ms and packets for a powered-off STA could retain pbufs until expiry.
+ * Use the SDK's existing audio lifetime without enabling the other Wi-Fi
+ * audio build options. */
 const uint16_t tx_lft_ms = 40;
-#else /* PLF_WIFI_AUDIO */
+#else
 const uint16_t tx_lft_ms = 1000;
-#endif /* PLF_WIFI_AUDIO */
+#endif
 
 bool ht_support  = 1;
 #if defined(CFG_BWMODE)

@@ -45,7 +45,7 @@ functions = ''.join(function(n) for n in [
     'uacm_diag_rate', 'uacm_track_record_seq', 'uacm_block_power', 'uacm_ema_u64',
     'uacm_update_vad', 'uacm_smooth_gain', 'uacm_sat_s16', 'uacm_mix_pcm'])
 network = (root / 'tests/uac_udp4_net_mocks.h').read_text() + ''.join(function(n) for n in [
-    'uacm_barrier', 'uacm_ring_reset', 'uacm_rx_lock', 'uacm_rx_unlock',
+    'uacm_barrier', 'uacm_ring_used', 'uacm_ring_reset', 'uacm_rx_lock', 'uacm_rx_unlock',
     'uacm_close_record', 'uacm_close_playback', 'uacm_same_peer', 'uacm_poll_udp',
     'uacm_build_header', 'uacm_prepare_ctrl', 'uacm_service_tx'])
 out = root / 'build/uac_udp4_tests'

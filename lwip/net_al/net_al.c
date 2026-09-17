@@ -76,6 +76,24 @@ u16_t lwip_standard_chksum(const void *dataptr, int len);
  * @return ERR_OK upon successful pushing of the buffer, ERR_BUF otherwise
  ****************************************************************************************
  */
+/* Submission and SDK release-hook counts are separate: release callbacks
+ * also include L2/control traffic, so their difference is NOT an in-flight count. */
+static uint32_t tx_diag_submit_ok, tx_diag_submit_fail, tx_diag_ref_rollback;
+static uint32_t tx_diag_release_calls, tx_diag_freed_nodes;
+
+void net_tx_diag_log(void)
+{
+    uint32_t ok, fail, rollback, releases, nodes;
+    uint32_t level = rtos_protect();
+    ok = tx_diag_submit_ok; fail = tx_diag_submit_fail;
+    rollback = tx_diag_ref_rollback; releases = tx_diag_release_calls;
+    nodes = tx_diag_freed_nodes;
+    rtos_unprotect(level);
+    dbg("LWIP TX_REF submit_ok=%u submit_fail=%u ref_rollback=%u release_calls=%u freed_nodes=%u t=%u\n",
+        (unsigned)ok, (unsigned)fail, (unsigned)rollback,
+        (unsigned)releases, (unsigned)nodes, (unsigned)sys_now());
+}
+
 static err_t net_if_output(struct netif *net_if, struct pbuf *p_buf)
 {
     err_t status = ERR_BUF;
@@ -115,6 +133,12 @@ static err_t net_if_output(struct netif *net_if, struct pbuf *p_buf)
          * submission did not take ownership, so release that extra reference
          * immediately; lwIP still owns and will release its original one. */
         pbuf_free(p_buf);
+    }
+    {
+        uint32_t level = rtos_protect();
+        if (status == ERR_OK) tx_diag_submit_ok++;
+        else { tx_diag_submit_fail++; tx_diag_ref_rollback++; }
+        rtos_unprotect(level);
     }
 
     return (status);
@@ -371,8 +395,12 @@ void net_buf_tx_info(net_buf_tx_t *buf, uint16_t *tot_len, uint8_t *seg_cnt)
 
 void net_buf_tx_free(net_buf_tx_t *buf)
 {
-    // Free the buffer
-    pbuf_free(buf);
+    /* Count actual nodes freed, not merely requests to drop a reference. */
+    uint8_t freed = pbuf_free(buf);
+    uint32_t level = rtos_protect();
+    tx_diag_release_calls++;
+    tx_diag_freed_nodes += freed;
+    rtos_unprotect(level);
 }
 
 #if 1

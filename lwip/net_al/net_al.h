@@ -272,6 +272,8 @@ void net_buf_tx_info(net_buf_tx_t *buf, uint16_t *tot_len, uint8_t *seg_cnt);
  ****************************************************************************************
  */
 void net_buf_tx_free(net_buf_tx_t *buf);
+/* Lifetime TX submission/release diagnostics; not an in-flight count. */
+void net_tx_diag_log(void);
 
 /**
  ****************************************************************************************

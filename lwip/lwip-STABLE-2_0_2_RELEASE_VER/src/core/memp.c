@@ -46,6 +46,8 @@
 #include "lwip/opt.h"
 
 #include "lwip/memp.h"
+#include "lwip/pbuf_diag.h"
+#include "dbg.h"
 #include "lwip/sys.h"
 #include "lwip/stats.h"
 
@@ -286,6 +288,41 @@ memp_init(void)
 #endif /* MEMP_OVERFLOW_CHECK >= 2 */
 }
 
+/* Track at actual pool mutation sites, not wrappers: another task may free
+ * an allocation immediately after the allocator releases its protection. */
+static struct memp_pbuf_diag pbuf_diag;
+
+void memp_pbuf_diag_get(struct memp_pbuf_diag *out)
+{
+  SYS_ARCH_DECL_PROTECT(level);
+  if (out == NULL) return;
+  SYS_ARCH_PROTECT(level);
+  *out = pbuf_diag;
+#if MEMP_MEM_MALLOC
+  out->heap_mode = 1;
+  out->capacity = 0; /* no fixed pool */
+#else
+  out->capacity = memp_pools[MEMP_PBUF]->num;
+#endif
+  SYS_ARCH_UNPROTECT(level);
+}
+
+void memp_pbuf_diag_log(void)
+{
+  struct memp_pbuf_diag d;
+  SYS_ARCH_DECL_PROTECT(level);
+  SYS_ARCH_PROTECT(level);
+  memp_pbuf_diag_get(&d);
+  pbuf_diag.window_peak = pbuf_diag.used;
+  SYS_ARCH_UNPROTECT(level);
+  dbg("LWIP PBUF_POOL capacity=%u heap_mode=%u used=%u free=%u peak=%u window_peak=%u alloc=%u freed=%u fail=%u free_underflow=%u t=%u\n",
+      (unsigned)d.capacity, (unsigned)d.heap_mode, (unsigned)d.used,
+      (unsigned)(d.capacity >= d.used ? d.capacity - d.used : 0),
+      (unsigned)d.peak, (unsigned)d.window_peak, (unsigned)d.alloc_ok,
+      (unsigned)d.freed, (unsigned)d.fail, (unsigned)d.free_underflow,
+      (unsigned)sys_now());
+}
+
 static void*
 #if !MEMP_OVERFLOW_CHECK
 do_memp_malloc_pool(const struct memp_desc *desc)
@@ -332,10 +369,17 @@ do_memp_malloc_pool_fn(const struct memp_desc *desc, const char* file, const int
       desc->stats->max = desc->stats->used;
     }
 #endif
+    if (desc == memp_pools[MEMP_PBUF]) {
+      pbuf_diag.alloc_ok++;
+      pbuf_diag.used++;
+      if (pbuf_diag.used > pbuf_diag.peak) pbuf_diag.peak = pbuf_diag.used;
+      if (pbuf_diag.used > pbuf_diag.window_peak) pbuf_diag.window_peak = pbuf_diag.used;
+    }
     SYS_ARCH_UNPROTECT(old_level);
     /* cast through u8_t* to get rid of alignment warnings */
     return ((u8_t*)memp + MEMP_SIZE);
   } else {
+    if (desc == memp_pools[MEMP_PBUF]) pbuf_diag.fail++;
     LWIP_DEBUGF(MEMP_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("memp_malloc: out of memory in pool %s\n", desc->desc));
 #if MEMP_STATS
     desc->stats->err++;
@@ -424,6 +468,11 @@ do_memp_free_pool(const struct memp_desc* desc, void *mem)
 #if MEMP_STATS
   desc->stats->used--;
 #endif
+  if (desc == memp_pools[MEMP_PBUF]) {
+    pbuf_diag.freed++;
+    if (pbuf_diag.used) pbuf_diag.used--;
+    else pbuf_diag.free_underflow++;
+  }
 
 #if MEMP_MEM_MALLOC
   LWIP_UNUSED_ARG(desc);

@@ -7,6 +7,7 @@ import subprocess
 
 p = argparse.ArgumentParser()
 p.add_argument('--cc', default='gcc')
+p.add_argument('--arm', action='store_true', help='Check AP and lwIP with ARM GCC')
 args = p.parse_args()
 root = Path(__file__).resolve().parents[1]
 dirs = ['user/src/pub', 'plf/aic8800m40/src/arch',
@@ -21,7 +22,7 @@ lwip = 'lwip/lwip-STABLE-2_0_2_RELEASE_VER'
 dirs += [lwip + '/src/include', lwip + '/ports/rtos/include']
 flags = ['-fsyntax-only', '-std=gnu99', '-m32', '-Wall', '-Wextra',
          '-Werror=implicit-function-declaration',
-         '-DCFG_AIC8800M40', '-DCFG_WIFI_RAM_VER', '-DCFG_HOSTAPD',
+         '-DCFG_AIC8800M40', '-DCFG_WIFI_RAM_VER', '-DCFG_SOFTAP',
          '-DCFG_WIFI_STACK', '-DCFG_DBG', '-DCFG_RTOS', '-DCFG_USB_DEVICE',
          '-DCFG_HW_PLATFORM=2', '-DCFG_RF_MODE=3', '-DCFG_BT_MODE=0',
          '-DCFG_DACL_MIXER_MODE=0', '-DCFG_DACR_MIXER_MODE=0',
@@ -29,11 +30,21 @@ flags = ['-fsyntax-only', '-std=gnu99', '-m32', '-Wall', '-Wextra',
          '-D__packed=__attribute__((packed))', '-DLWIP_NO_STDINT_H=1']
 # The SDK port supplies its own integer typedefs. Windows errno macro
 # redefinition warnings are expected and retained in the log.
+sources = ['user/src/pub/demo_src.c']
+if args.arm:
+    flags.remove('-m32')
+    flags += ['-mcpu=cortex-m4', '-mthumb', '-DLWIP_TIMEVAL_PRIVATE=0',
+              '-include', 'sys/time.h']
+    dirs += [lwip + '/src/include/lwip/priv']
+    sources += [lwip + '/src/core/pbuf.c', lwip + '/src/api/sockets.c',
+                lwip + '/src/core/memp.c', 'lwip/net_al/net_al.c',
+                'wifi/fhost/fhost_config.c']
 cmd = [args.cc] + flags + ['-I' + d for d in dict.fromkeys(dirs)] + [
-    '-idirafter', lwip + '/src/include/lwip', 'user/src/pub/demo_src.c']
+    '-idirafter', lwip + '/src/include/lwip'] + sources
 result = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
 out = root / 'build/uac_udp4_tests'
 out.mkdir(parents=True, exist_ok=True)
 (out / 'syntax.log').write_text(result.stdout + result.stderr, encoding='utf-8')
-print('PASS: SDK-header host syntax check (not ARM link)' if not result.returncode else result.stderr)
+print(('PASS: ARM AP/lwIP syntax check (not firmware link)' if args.arm else
+       'PASS: SDK-header host syntax check (not ARM link)') if not result.returncode else result.stderr)
 raise SystemExit(result.returncode)

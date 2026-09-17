@@ -45,6 +45,7 @@
  */
 
 #include "lwip/opt.h"
+#include "lwip/alloc_diag.h"
 
 #if LWIP_SOCKET /* don't build if not configured for use in lwipopts.h */
 
@@ -1346,6 +1347,7 @@ lwip_sendto(int s, const void *data, size_t size, int flags,
 #if LWIP_NETIF_TX_SINGLE_PBUF
   /* Allocate a new netbuf and copy the data into it. */
   if (netbuf_alloc(&buf, short_size) == NULL) {
+    LWIP_ALLOC_FAIL("sendto_netbuf_alloc", short_size);
     err = ERR_MEM;
   } else {
 #if LWIP_CHECKSUM_ON_COPY
@@ -1361,6 +1363,7 @@ lwip_sendto(int s, const void *data, size_t size, int flags,
   }
 #else /* LWIP_NETIF_TX_SINGLE_PBUF */
   err = netbuf_ref(&buf, data, short_size);
+  if (err == ERR_MEM) LWIP_ALLOC_FAIL("sendto_netbuf_ref", short_size);
 #endif /* LWIP_NETIF_TX_SINGLE_PBUF */
   if (err == ERR_OK) {
 #if LWIP_IPV4 && LWIP_IPV6
@@ -1373,6 +1376,7 @@ lwip_sendto(int s, const void *data, size_t size, int flags,
 
     /* send the data */
     err = netconn_send(sock->conn, &buf);
+    if (err == ERR_MEM) LWIP_ALLOC_FAIL("sendto_netconn_send", short_size);
   }
 
   /* deallocated the buffer */
